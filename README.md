@@ -38,17 +38,40 @@
 
 ## 📦 安装
 
-### 方式一：插件管理器安装（推荐）
+### 方式一：插件管理器安装（推荐，全自动）
+
+在 DeepSeek Harness 的对话框里让 AI 执行（或自己在终端执行）：
 
 ```bash
-git clone https://github.com/zhu3899/english-journal-reader.git
+git clone https://github.com/zhu3899/english-journal-reader.git D:\repos\english-journal-reader
 ```
 
-在 DeepSeek Harness 中打开 **插件 → 已安装 → 从目录安装**，选择克隆出的 `english-journal-reader` 目录即可。
+然后打开 Harness 界面的 **插件 → 已安装 → 从目录安装**，选择克隆出的 `english-journal-reader` 目录即可。
 
-### 方式二：手动复制
+> 「从目录安装」会自动完成包注册（写入 profile 的 `node_modules`）和启用声明（写入 `cordis.patch.yml`）两步，装完重启 Harness 生效。之后插件更新了代码，重新执行一次「从目录安装」（或重启）即可加载新版。
 
-将仓库文件放入任意目录，在 Harness 的 `cordis.patch.yml` 中插入：
+### 方式二：手动安装（不使用按钮）
+
+<details>
+<summary>展开查看完整步骤</summary>
+
+插件要被 Harness 加载需要满足两个条件：**包出现在 profile 的 `node_modules` 里**（Harness 按包名查找）+ **在 `cordis.patch.yml` 里声明启用**。手动安装就是把这两步自己做一遍：
+
+```powershell
+# 1. 克隆仓库到任意位置
+git clone https://github.com/zhu3899/english-journal-reader.git D:\repos\english-journal-reader
+
+# 2. 把包目录"挂"进 profile 的 node_modules（Junction = 文件系统级快捷方式，不占双份磁盘；
+#    用复制整个文件夹代替也可以）
+New-Item -ItemType Junction `
+  -Path "$env:DSH_PROFILE_DIR\node_modules\@local\journal-reader" `
+  -Target "D:\repos\english-journal-reader"
+
+# 3. 用文本编辑器打开 profile 的启用清单
+notepad "$env:DSH_PROFILE_DIR\cordis.patch.yml"
+
+# 4. 在文件末尾追加以下内容（与现有条目对齐，保持 YAML 缩进）后保存：
+```
 
 ```yaml
 - insert:
@@ -57,9 +80,17 @@ git clone https://github.com/zhu3899/english-journal-reader.git
       config: {}
 ```
 
-并把该目录链接/复制进 profile 的 `node_modules`。
+```powershell
+# 5. 重启 Harness，左侧栏出现「外刊精读台」图标即安装成功
+```
+
+> `$env:DSH_PROFILE_DIR` 是 Harness 自动设置的环境变量，指向当前 profile 目录（如 `C:\Users\<你>\.dsh\profiles\desktop`）。用 Junction 的好处：以后在 D:\repos 里 `git pull` 更新插件，无需重新安装，重启即生效。
+
+</details>
 
 ## ⚙️ 配置
+
+插件无需配置即可使用（AI 讲解/翻译/问答依赖 Harness 设置里已配置的默认模型）。唯一可选的自定义项：
 
 | 字段 | 默认值 | 说明 |
 |---|---|---|
