@@ -1147,10 +1147,9 @@ window.__ModuleLoader__.load({
 				if (saved.path !== session.reader.path || !Array.isArray(saved.msgs)) return null;
 				return { msgs: saved.msgs, busy: false };
 			});
-			const [initialChatOpen] = useState(() => {
-				const session = readJson(SESSION_KEY, {});
-				return Boolean(session && session.chatOpen);
-			});
+			// The chat panel ALWAYS starts closed. History is one click away (topbar button);
+			// a restored session must never pop the panel open by itself.
+			const [initialChatOpen] = useState(() => false);
 			const [initialDual] = useState(() => {
 				const session = readJson(SESSION_KEY, {});
 				return Boolean(session && session.dual);
