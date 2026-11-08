@@ -38,19 +38,28 @@
 
 ## 📦 安装
 
-### 方式一：插件管理器安装（推荐，全自动）
-
-在 DeepSeek Harness 的对话框里让 AI 执行（或自己在终端执行）：
+### 方式一：dsh CLI 一条命令安装（推荐）
 
 ```bash
-git clone https://github.com/zhu3899/english-journal-reader.git D:\repos\english-journal-reader
+dsh plugin --profile <profile名> add git+https://github.com/zhu3899/english-journal-reader.git
 ```
 
-然后打开 Harness 界面的 **插件 → 已安装 → 从目录安装**，选择克隆出的 `english-journal-reader` 目录即可。
+`--profile` 填你的 profile 名（Desktop 默认是 `desktop`，用 `dsh --help` 可确认）。这条命令全自动完成三件事：**从 GitHub 直接拉包安装**（无需先 clone）、**注册依赖**到 profile 的 `package.json`、**声明 bundle 启用**。重启 Harness 生效。
 
-> 「从目录安装」会自动完成包注册（写入 profile 的 `node_modules`）和启用声明（写入 `cordis.patch.yml`）两步，装完重启 Harness 生效。之后插件更新了代码，重新执行一次「从目录安装」（或重启）即可加载新版。
+其他管理命令：
 
-### 方式二：手动安装（不使用按钮）
+```bash
+dsh plugin --profile desktop list                          # 列出已装插件
+dsh plugin --profile desktop remove @local/journal-reader  # 卸载
+```
+
+### 方式二：插件管理器界面安装
+
+克隆仓库后，在 DeepSeek Harness 界面打开 **插件 → 已安装 → 从目录安装**，选择克隆出的 `english-journal-reader` 目录即可。
+
+> 「从目录安装」会自动完成包注册（写入 profile 的 `node_modules`）和启用声明两步，装完重启 Harness 生效。之后插件更新了代码，重新执行一次「从目录安装」（或重启）即可加载新版。
+
+### 方式三：完全手动（不使用任何工具）
 
 <details>
 <summary>展开查看完整步骤</summary>
