@@ -8,6 +8,7 @@
  *  - GET /jr/api/explain?text=<...>&mode=...   AI explanation streamed as plain text over ctx.llm
  */
 import fs from 'node:fs/promises';
+import fsSync from 'node:fs';
 import { existsSync } from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
@@ -31,6 +32,44 @@ const parsedCache = new Map();
 const inflight = new Map();
 const transCache = new Map();
 const cacheDir = path.join(os.tmpdir(), 'dsh-journal-reader');
+// Persistent app-state file (chats archive, saved marks, reading progress, settings).
+// DSH_PROFILE_DIR is NOT set in the app process, so locate the profile from this package's own
+// path: <profile>/node_modules/@local/journal-reader/index.js → walk up to the profile root.
+// Falls back to the dsh home if the walk fails.
+function resolveProfileDir() {
+	const candidates = [];
+	if (process.env.DSH_PROFILE_DIR) candidates.push(process.env.DSH_PROFILE_DIR);
+	let dir = path.dirname(new URL(import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, '$1'));
+	for (let i = 0; i < 6; i++) {
+		const parent = path.dirname(dir);
+		if (path.basename(dir) === 'node_modules' || parent === dir) {
+			if (path.basename(dir) === 'node_modules') candidates.push(path.dirname(dir));
+			break;
+		}
+		dir = parent;
+	}
+	for (const c of candidates) {
+		try { if (existsSync(path.join(c, 'package.json')) && existsSync(path.join(c, 'node_modules'))) return c; } catch {}
+	}
+	try { return path.join(process.env.DSH_HOME || path.join(os.homedir(), '.dsh'), 'profiles', 'desktop'); } catch {}
+	return os.homedir();
+}
+
+// The tmp cache dir is proven writable by the app (epub/pdf caches live there); the profile
+// dir failed writeState inside the app for unknown reasons (ACL fine, no lock — likely a
+// filesystem filter driver interfering). Same persistence semantics, different location.
+const stateFile = path.join(cacheDir, 'journal-reader-state.json');
+const profileStateFile = path.join(resolveProfileDir(), 'journal-reader-state.json');
+function initStateFile() {
+	// One-time migration: if an older version left state in the profile location, carry it over.
+	try {
+		if (!fs.existsSync(stateFile) && fs.existsSync(profileStateFile)) {
+			fs.copyFileSync(profileStateFile, stateFile);
+		}
+	} catch {}
+}
+initStateFile();
+let lastWriteError = null;
 const MODEL_INFO_CACHE_MS = 10 * 60 * 1000;
 
 let LIBRARY_DIR = path.join(os.homedir(), 'Downloads', 'EnglishJournals');
@@ -74,6 +113,72 @@ async function handleRead(ctx, url, res) {
 	}
 }
 
+// —— Persistent app state (origin-independent storage for chats/saved/progress/settings) ——
+let stateWriteTimer = null;
+
+function readState() {
+	try {
+		return JSON.parse(fsSync.readFileSync(stateFile, 'utf8'));
+	} catch {
+		return {};
+	}
+}
+
+function writeState(state) {
+	try {
+		fsSync.writeFileSync(stateFile, JSON.stringify(state, null, 2));
+		return true;
+	} catch (error) {
+		lastWriteError = String((error && error.code) || (error && error.message) || error);
+		console.error('[journal-reader] state write failed:', lastWriteError);
+		return false;
+	}
+}
+
+/** Merge one top-level key into the state file with a short debounce to coalesce rapid writes. */
+function mergeState(key, value) {
+	const state = readState();
+	state[key] = value;
+	if (stateWriteTimer) clearTimeout(stateWriteTimer);
+	// Write immediately; the debounce only re-writes the SAME snapshot (never a fresh readState,
+	// which would clobber concurrent writes from another fiber generation with stale data).
+	writeState(state);
+	stateWriteTimer = setTimeout(() => writeState(state), 400);
+}
+
+async function handleState(ctx, req, res) {
+	if (req.method === 'GET') {
+		const url = new URL(String(req.url), 'http://localhost');
+		const key = url.searchParams.get('key') || '';
+		if (!/^[a-z_.]+$/i.test(key)) return fail(res, 'invalid state key', 400);
+		const state = readState();
+		sendJson(res, 200, { value: state[key] ?? null });
+		return;
+	}
+	if (req.method === 'POST') {
+		let body;
+		try {
+			body = JSON.parse(await readBody(req, 5 * 1024 * 1024));
+		} catch {
+			return fail(res, 'invalid JSON body', 400);
+		}
+		const key = typeof body.key === 'string' && /^[a-z_.]+$/i.test(body.key) ? body.key : '';
+		if (!key) return fail(res, 'invalid state key', 400);
+		if (body.value === undefined || body.value === null) {
+			const state = readState();
+			delete state[key];
+			writeState(state);
+		} else {
+			mergeState(key, body.value);
+		}
+		sendJson(res, 200, { ok: true });
+		return;
+	}
+	res.statusCode = 405;
+	res.setHeader('allow', 'GET, POST');
+	res.end();
+}
+
 function sendJson(res, status, value) {
 	const body = JSON.stringify(value);
 	res.statusCode = status;
@@ -85,20 +190,118 @@ function fail(res, message, status = 500) {
 	sendJson(res, status, { error: String(message) });
 }
 
-async function ghContents(query, signal) {
-	const api = `https://api.github.com/repos/${REPO.owner}/${REPO.repo}/contents/${query.split('/').map(encodeURIComponent).join('/')}?ref=${REPO.branch}`;
-	const res = await fetch(api, {
-		signal,
-		headers: {
-			accept: 'application/vnd.github+json',
-			'user-agent': 'dsh-journal-reader-plugin (+https://github.com/hehonghui/awesome-english-ebooks)'
+const GH_RETRY_STATUS = new Set([502, 503, 504]);
+
+/**
+ * Whole-repo tree in ONE request (recursive): every magazine/issue directory at once.
+ * A 304 (unchanged) costs nothing against the rate limit, so refreshes are quota-free.
+ * Replaces the previous 8+ /contents calls per shelf load.
+ * Auth: when the user has the GitHub CLI logged in, its token lifts the rate limit
+ * from 60 to 5000 requests/hour; the token is read at request time, never stored.
+ */
+let ghTokenCache = { at: 0, token: null };
+
+function ghExe() {
+	const candidates = [
+		process.env.GH_PATH || null,
+		'C:/Program Files/GitHub CLI/gh.exe',
+		'C:/Program Files (x86)/GitHub CLI/gh.exe'
+	].filter(Boolean);
+	for (const c of candidates) {
+		try { if (existsSync(c)) return c; } catch {}
+	}
+	return 'gh';
+}
+
+async function ghToken() {
+	if (Date.now() - ghTokenCache.at < 10 * 60 * 1000) return ghTokenCache.token;
+	ghTokenCache = { at: Date.now(), token: null };
+	try {
+		const { execFile } = await import('node:child_process');
+		const { promisify } = await import('node:util');
+		const { stdout } = await promisify(execFile)(ghExe(), ['auth', 'token', '--hostname', 'github.com'], { timeout: 8000, windowsHide: true, encoding: 'utf8' });
+		const token = String(stdout).trim();
+		if (/^gh[pousr]_/.test(token) || (token.length >= 30 && !/\s/.test(token))) ghTokenCache.token = token;
+	} catch {}
+	return ghTokenCache.token;
+}
+
+async function fetchIssueTree(signal) {
+	const api = `https://api.github.com/repos/${REPO.owner}/${REPO.repo}/git/trees/${REPO.branch}?recursive=1`;
+	const state = readState();
+	const saved = state.tree || null;
+	const headers = {
+		accept: 'application/vnd.github+json',
+		'user-agent': 'dsh-journal-reader-plugin (+https://github.com/hehonghui/awesome-english-ebooks)'
+	};
+	const token = await ghToken();
+	if (token) headers.authorization = `Bearer ${token}`;
+	if (saved && saved.etag) headers['if-none-match'] = saved.etag;
+	for (let attempt = 0; ; attempt++) {
+		const res = await fetch(api, { signal, headers });
+		if (res.status === 304 && saved) return saved.data;
+		if (res.ok) {
+			const data = await res.json();
+			mergeState('tree', { at: Date.now(), etag: res.headers.get('etag') || null, data });
+			return data;
 		}
-	});
-	if (!res.ok) {
 		if (res.status === 403) throw new Error('GitHub API rate limit reached (unauthenticated 60 requests/hour); try again later');
+		if (GH_RETRY_STATUS.has(res.status) && attempt < 2) {
+			await new Promise((resolve, reject) => {
+				const timer = setTimeout(resolve, 1200 * (attempt + 1));
+				signal?.addEventListener('abort', () => { clearTimeout(timer); reject(new Error('aborted')); }, { once: true });
+			});
+			continue;
+		}
 		throw new Error(`GitHub API HTTP ${res.status}`);
 	}
-	return res.json();
+}
+
+/** Build the magazines/issues structure from one recursive tree response. */
+function issuesFromTree(treeData) {
+	const byMag = new Map(MAGAZINES.map((m) => [m.key, []]));
+	for (const node of treeData.tree || []) {
+		if (node.type !== 'tree') continue;
+		const parts = node.path.split('/');
+		if (parts.length < 2 || parts.length > 3) continue;
+		const magKey = parts[0];
+		if (!byMag.has(magKey)) continue;
+		const match = ISSUE_DIR_RE.exec(node.path.split('/').pop());
+		if (!match) continue;
+		byMag.get(magKey).push({ dir: node.path.split('/').pop(), path: node.path, date: `${match[1]}-${match[2]}-${match[3]}` });
+	}
+	return MAGAZINES.map((mag) => {
+		const issues = (byMag.get(mag.key) || []).sort((a, b) => (a.date < b.date ? 1 : a.date > b.date ? -1 : 0));
+		return { ...mag, issues, latest: issues[0] ?? null, error: null };
+	});
+}
+
+async function ghContents(query, signal) {
+	const api = `https://api.github.com/repos/${REPO.owner}/${REPO.repo}/contents/${query.split('/').map(encodeURIComponent).join('/')}?ref=${REPO.branch}`;
+	const cached = listingCache.get(query);
+	const headers = {
+		accept: 'application/vnd.github+json',
+		'user-agent': 'dsh-journal-reader-plugin (+https://github.com/hehonghui/awesome-english-ebooks)'
+	};
+	if (cached && cached.etag) headers['if-none-match'] = cached.etag;
+	for (let attempt = 0; ; attempt++) {
+		const res = await fetch(api, { signal, headers });
+		if (res.ok) {
+			const etag = res.headers.get('etag') || null;
+			const data = await res.json();
+			return { data, etag };
+		}
+		if (res.status === 304 && cached) return { data: cached.data, etag: cached.etag };
+		if (res.status === 403) throw new Error('GitHub API rate limit reached (unauthenticated 60 requests/hour); try again later');
+		if (GH_RETRY_STATUS.has(res.status) && attempt < 2) {
+			await new Promise((resolve, reject) => {
+				const timer = setTimeout(resolve, 1200 * (attempt + 1));
+				signal?.addEventListener('abort', () => { clearTimeout(timer); reject(new Error('aborted')); }, { once: true });
+			});
+			continue;
+		}
+		throw new Error(`GitHub API HTTP ${res.status}`);
+	}
 }
 
 async function cachedListing(dirPath, force, signal) {
@@ -108,9 +311,30 @@ async function cachedListing(dirPath, force, signal) {
 	if (pending && !force) return pending;
 	const task = (async () => {
 		try {
-			const data = await ghContents(dirPath, signal);
-			listingCache.set(dirPath, { at: Date.now(), data });
+			// Persisted cache (survives restarts): fall back to it when quota is exhausted.
+			const state = readState();
+			const saved = (state.listings || {})[dirPath];
+			if (!hit && !force && saved && Date.now() - saved.at < LISTING_TTL_MS * 6) {
+				listingCache.set(dirPath, { at: saved.at, data: saved.data, etag: saved.etag || null });
+				return saved.data;
+			}
+			const { data, etag } = await ghContents(dirPath, signal);
+			listingCache.set(dirPath, { at: Date.now(), data, etag });
+			const listings = (readState().listings || {});
+			listings[dirPath] = { at: Date.now(), data, etag };
+			mergeState('listings', listings);
 			return data;
+		} catch (error) {
+			// Quota exhausted but we have ANY persisted copy: serve it rather than failing.
+			if (!hit) {
+				const state = readState();
+				const saved = (state.listings || {})[dirPath];
+				if (saved) {
+					listingCache.set(dirPath, { at: saved.at, data: saved.data, etag: saved.etag || null });
+					return saved.data;
+				}
+			}
+			throw error;
 		} finally {
 			inflight.delete(dirPath);
 		}
@@ -125,45 +349,32 @@ function rawUrl(...segments) {
 
 async function handleIssues(ctx, url, res) {
 	const force = url.searchParams.get('refresh') === '1';
-	if (force) {
-		parsedCache.clear();
-		listingCache.clear();
-	}
-	const magazines = [];
-	for (const mag of MAGAZINES) {
-		try {
-			const rootRows = await cachedListing(mag.key, force, undefined);
-			const issues = [];
-			const seen = new Set();
-			const collect = (rows, prefix) => {
-				for (const row of rows) {
-					if (row.type !== 'dir') continue;
-					const match = ISSUE_DIR_RE.exec(row.name);
-					if (!match || seen.has(row.name)) continue;
-					seen.add(row.name);
-					issues.push({ dir: row.name, path: `${prefix}/${row.name}`, date: `${match[1]}-${match[2]}-${match[3]}` });
-				}
-			};
-			collect(rootRows, mag.key);
-			const yearDirs = rootRows.filter((row) => row.type === 'dir' && YEAR_DIR_RE.test(row.name));
-			for (const yearDir of yearDirs) {
-				try {
-					const subRows = await cachedListing(`${mag.key}/${yearDir.name}`, force, undefined);
-					collect(subRows, `${mag.key}/${yearDir.name}`);
-				} catch {}
-			}
-			issues.sort((a, b) => (a.date < b.date ? 1 : a.date > b.date ? -1 : 0));
-			magazines.push({ ...mag, issues, latest: issues[0] ?? null, error: null });
-		} catch (error) {
-			magazines.push({ ...mag, issues: [], latest: null, error: String(error.message || error) });
+	if (force) parsedCache.clear();
+	try {
+		// One tree request serves the whole shelf (or a free 304 when nothing changed).
+		const treeData = await fetchIssueTree(undefined);
+		const magazines = issuesFromTree(treeData);
+		const llm = ctx.get('llm');
+		sendJson(res, 200, {
+			magazines,
+			explainReady: Boolean(llm && typeof llm.stream === 'function'),
+			repoHtml: `https://github.com/${REPO.owner}/${REPO.repo}`
+		});
+	} catch (error) {
+		// Serve the persisted tree when quota/network fails, rather than an error page.
+		const saved = readState().tree;
+		if (saved && saved.data) {
+			const llm = ctx.get('llm');
+			sendJson(res, 200, {
+				magazines: issuesFromTree(saved.data),
+				explainReady: Boolean(llm && typeof llm.stream === 'function'),
+				repoHtml: `https://github.com/${REPO.owner}/${REPO.repo}`,
+				stale: true
+			});
+			return;
 		}
+		fail(res, error.message || error, 502);
 	}
-	const llm = ctx.get('llm');
-	sendJson(res, 200, {
-		magazines,
-		explainReady: Boolean(llm && typeof llm.stream === 'function'),
-		repoHtml: `https://github.com/${REPO.owner}/${REPO.repo}`
-	});
 }
 
 async function ensureParsed(issuePath) {
@@ -825,6 +1036,7 @@ async function handle(ctx, req, res) {
 			}
 			return await handleAsk(ctx, req, res);
 		}
+		if (route === '/state') return await handleState(ctx, req, res);
 		if (req.method !== 'GET' && req.method !== 'HEAD') {
 			res.statusCode = 405;
 			res.setHeader('allow', 'GET');

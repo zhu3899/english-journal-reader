@@ -174,11 +174,20 @@ window.__ModuleLoader__.load({
 			'.jr-article a{color:var(--dsw-alias-brand-primary)}',
 			'.jr-popup{position:fixed;z-index:60;max-width:460px;min-width:260px;max-height:340px;overflow:auto;background:var(--dsw-alias-bg-overlay);border:1px solid var(--dsw-alias-border-l2);border-radius:12px;box-shadow:0 8px 28px rgba(0,0,0,.22);padding:12px;font-size:13px;line-height:1.6;color:var(--dsw-alias-label-primary)}',
 			'.jr-popup-actions{display:flex;gap:8px;flex-wrap:wrap;align-items:center}',
+			'.jr-popup-bar{display:flex;flex-direction:column;gap:10px}',
+			'.jr-popup-grip{display:flex;align-items:center;gap:8px;width:100%;appearance:none;border:0;background:none;color:var(--dsw-alias-label-secondary);font:inherit;font-size:12px;padding:2px 2px;cursor:grab;user-select:none;text-align:left}',
+			'.jr-popup-grip:active{cursor:grabbing}',
+			'.jr-popup-grip:hover{color:var(--dsw-alias-label-primary)}',
+			'.jr-popup-grip-dots{font-size:13px;letter-spacing:1px;flex:none}',
+			'.jr-popup-grip-label{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--dsw-alias-label-primary);font-weight:600}',
+			'.jr-popup-grip-chevron{font-size:10px;flex:none;opacity:.8}',
+			'.jr-popup-bar.is-collapsed .jr-popup-grip{padding:4px 2px}',
+			'.jr-popup-bodywrap{padding-top:2px}',
 			'.jr-drag{cursor:grab;color:var(--dsw-alias-label-secondary);font-size:14px;padding:0 3px;user-select:none;line-height:1}',
-			'.jr-chat{width:380px;min-width:260px;flex:none;border-left:1px solid var(--dsw-alias-border-l1);display:flex;flex-direction:column;background:var(--dsw-alias-bg-layer-1);min-height:0}',
-			'.jr-chat-resize{width:14px;flex:none;cursor:ew-resize;background:transparent;position:relative}',
-			'.jr-chat-resize:after{content:"";position:absolute;left:5px;top:0;bottom:0;width:3px;background:var(--dsw-alias-border-l2);border-radius:2px;transition:background .15s,left .15s}',
-			'.jr-chat-resize:hover:after,.jr-chat-resize:active:after{left:3px;width:8px;background:var(--dsw-alias-brand-primary)}',
+			'.jr-chat{width:380px;min-width:260px;flex:none;border-left:1px solid var(--dsw-alias-border-l1);display:flex;flex-direction:column;background:var(--dsw-alias-bg-layer-1);min-height:0;position:relative}',
+			'.jr-chat-resize{position:absolute;left:-7px;top:0;bottom:0;width:14px;cursor:ew-resize;z-index:5}',
+			'.jr-chat-resize:after{content:"";position:absolute;left:6px;top:0;bottom:0;width:2px;background:var(--dsw-alias-border-l2);border-radius:1px;transition:background .15s,width .15s,left .15s}',
+			'.jr-chat-resize:hover:after,.jr-chat-resize:active:after{left:5px;width:3px;background:var(--dsw-alias-brand-primary)}',
 			'.jr-chat-head{display:flex;align-items:center;justify-content:space-between;padding:8px 12px;border-bottom:1px solid var(--dsw-alias-border-l1);font-weight:600;font-size:13px}',
 			'.jr-chat-msgs{flex:1;overflow-y:auto;padding:10px 12px;display:flex;flex-direction:column;gap:10px;min-height:0}',
 			'.jr-chat-msg{font-size:13px;line-height:1.65;word-break:break-word}',
@@ -214,14 +223,47 @@ window.__ModuleLoader__.load({
 			return () => { tag.remove(); };
 		}
 
+		// Persistent state lives on the HOST side (a JSON file next to the profile), because
+		// browser localStorage is origin-scoped and the GUI port changes every app restart —
+		// per-origin storage would strand chats/progress in dead namespaces. localStorage is
+		// still read once as a migration fallback for data written by older versions.
+		const stateCache = {};
+		const stateLoaded = {};
 		function readJson(key, fallback) {
+			if (stateLoaded[key]) {
+				const v = stateCache[key];
+				return v === undefined || v === null ? fallback : v;
+			}
+			// Synchronous localStorage fallback: bootstrap value until the host read resolves.
+			let local = fallback;
 			try {
 				const raw = localStorage.getItem(key);
-				return raw ? JSON.parse(raw) : fallback;
-			} catch { return fallback; }
+				if (raw) local = JSON.parse(raw);
+			} catch {}
+			stateLoaded[key] = false;
+			fetch('/jr/api/state?key=' + encodeURIComponent(key)).then(async (r) => {
+				if (!r.ok) { stateLoaded[key] = true; stateCache[key] = local; return; }
+				const data = await r.json().catch(() => ({}));
+				let value = data.value;
+				// Migration: seed the host file from localStorage if the host has nothing yet.
+				if ((value === undefined || value === null) && local !== undefined && local !== null && local !== fallback) {
+					writeJson(key, local);
+					value = local;
+				}
+				stateCache[key] = value === undefined || value === null ? fallback : value;
+				stateLoaded[key] = true;
+			}).catch(() => { stateLoaded[key] = true; stateCache[key] = local; });
+			return local;
 		}
 		function writeJson(key, value) {
+			stateCache[key] = value;
+			stateLoaded[key] = true;
 			try { localStorage.setItem(key, JSON.stringify(value)); } catch {}
+			fetch('/jr/api/state', {
+				method: 'POST',
+				headers: { 'content-type': 'application/json' },
+				body: JSON.stringify({ key, value })
+			}).catch(() => {});
 		}
 
 		async function getJson(url, signal) {
@@ -499,28 +541,38 @@ window.__ModuleLoader__.load({
 				: { left, top: Math.max(8, popup.rect.top - 8), transform: 'translate(-50%,-100%)' };
 
 			return h('div', { className: 'jr-popup', ref: popupRef, style: pos || style, onClick: (e) => e.stopPropagation() },
-				h('div', { className: 'jr-popup-actions' },
-					h('span', { className: 'jr-drag', draggable: true, title: '拖动', onDragStart: beginDrag, onDrag: doDrag, onDragEnd: endDrag }, '⠿'),
-					popup.isWord ? h('button', {
-						className: 'jr-mini', 'data-active': mode === 'dict' || undefined,
-						disabled: busy && mode !== 'dict', onClick: () => run('dict')
-					}, t('lookup')) : null,
-					h('button', { className: 'jr-mini', onClick: () => run('trans') }, t('translate')),
+				h('div', { className: collapsed ? 'jr-popup-bar is-collapsed' : 'jr-popup-bar' },
 					h('button', {
-						className: 'jr-mini',
-						disabled: !explainReady,
-						title: explainReady ? undefined : t('explainUnavailable'),
-						onClick: () => {
-							if (abortRef.current) { abortRef.current.abort(); abortRef.current = null; }
-							setBusy(false); setMode(null);
-							onClose();
-							onChat(popup.text, popup.isWord);
-						}
-					}, t('explain')),
-					h('button', { className: 'jr-mini', onClick: () => setCollapsed(!collapsed) }, collapsed ? '▾' : '▴'),
-					h('button', { className: 'jr-mini', onClick: () => { stop(); onClose(); } }, t('close'))
+						className: 'jr-popup-grip', draggable: collapsed || undefined,
+						title: collapsed ? '拖动' : '收起面板（拖动）',
+						onDragStart: beginDrag, onDrag: doDrag, onDragEnd: endDrag,
+						onClick: () => { if (!collapsed) { stop(); setCollapsed(true); } }
+					},
+						h('span', { className: 'jr-popup-grip-dots', 'aria-hidden': true }, '⠿'),
+						h('span', { className: 'jr-popup-grip-label' }, (mode === 'dict' && popup.text) || (mode === 'trans' && popup.text) || popup.text || ''),
+						h('span', { className: 'jr-popup-grip-chevron', 'aria-hidden': true }, collapsed ? '▾' : '▴')
+					),
+					!collapsed && h('div', { className: 'jr-popup-actions' },
+						popup.isWord ? h('button', {
+							className: 'jr-mini', 'data-active': mode === 'dict' || undefined,
+							disabled: busy && mode !== 'dict', onClick: () => run('dict')
+						}, t('lookup')) : null,
+						h('button', { className: 'jr-mini', onClick: () => run('trans') }, t('translate')),
+						h('button', {
+							className: 'jr-mini',
+							disabled: !explainReady,
+							title: explainReady ? undefined : t('explainUnavailable'),
+							onClick: () => {
+								if (abortRef.current) { abortRef.current.abort(); abortRef.current = null; }
+								setBusy(false); setMode(null);
+								onClose();
+								onChat(popup.text, popup.isWord);
+							}
+						}, t('explain')),
+						h('button', { className: 'jr-mini', onClick: () => { stop(); onClose(); } }, t('close'))
+					)
 				),
-				!collapsed && h('div', null,
+				!collapsed && h('div', { className: 'jr-popup-bodywrap' },
 					busy && !content ? h('div', { className: 'jr-hint' },
 						h('span', { className: 'jr-spin', style: { width: 12, height: 12, marginRight: 6 } }),
 						mode === 'dict' ? t('dictLoading') : mode === 'trans' ? t('transLoading') : t('explainLoading')
@@ -542,7 +594,7 @@ window.__ModuleLoader__.load({
 			);
 		}
 
-		function ReaderView({ path, t, explainReady, onBack, initialChat, initialDual }) {
+		function ReaderView({ path, t, explainReady, onBack, initialChat, initialChatOpen, initialDual }) {
 			const [meta, setMeta] = useState(null);
 			const [metaError, setMetaError] = useState(null);
 			const [chapterIndex, setChapterIndex] = useState(0);
@@ -564,7 +616,7 @@ window.__ModuleLoader__.load({
 			const [transMap, setTransMap] = useState({});
 			const transAbortsRef = useRef(new Set());
 			const [chat, setChat] = useState(() => (initialChat && Array.isArray(initialChat.msgs) ? initialChat : null));
-			const [chatOpen, setChatOpen] = useState(() => Boolean(initialChat && Array.isArray(initialChat.msgs) && initialChat.msgs.length));
+			const [chatOpen, setChatOpen] = useState(() => Boolean(initialChatOpen));
 			const [chatWidth, setChatWidth] = useState(() => {
 				const prefs = readJson(SETTINGS_KEY, {});
 				const w = Number(prefs.chatWidth);
@@ -607,13 +659,14 @@ window.__ModuleLoader__.load({
 				const prefs = readJson(SETTINGS_KEY, {});
 				setViewMode(prefs.pdfMode && prefs.pdfMode[magKey] ? prefs.pdfMode[magKey] : magKey.includes('new_yorker') ? 'pdf' : 'text');
 				// Restoring a session keeps the saved toggle; switching to another issue resets it
-				// and loads that issue's own archived conversation, if any.
+				// and loads that issue's archived conversation — but never auto-opens the panel:
+				// once the user closes it, it stays closed until they reopen it themselves.
 				setDual(magKey === initialMagRef.current ? Boolean(initialDual) : false);
 				if (magKey !== initialMagRef.current) {
 					const archive = readJson(CHATS_KEY, {});
 					const saved = archive[path];
 					setChat(saved && Array.isArray(saved.msgs) && saved.msgs.length ? { msgs: saved.msgs, busy: false } : null);
-					setChatOpen(Boolean(saved && Array.isArray(saved.msgs) && saved.msgs.length));
+					setChatOpen(false);
 				}
 			}, [magKey, path]);
 
@@ -1094,6 +1147,10 @@ window.__ModuleLoader__.load({
 				if (saved.path !== session.reader.path || !Array.isArray(saved.msgs)) return null;
 				return { msgs: saved.msgs, busy: false };
 			});
+			const [initialChatOpen] = useState(() => {
+				const session = readJson(SESSION_KEY, {});
+				return Boolean(session && session.chatOpen);
+			});
 			const [initialDual] = useState(() => {
 				const session = readJson(SESSION_KEY, {});
 				return Boolean(session && session.dual);
@@ -1133,6 +1190,7 @@ window.__ModuleLoader__.load({
 				t,
 				explainReady: Boolean(shelf.data && shelf.data.explainReady),
 				initialChat,
+				initialChatOpen,
 				initialDual,
 				onBack: () => {
 					setReader(null);
