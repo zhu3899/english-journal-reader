@@ -27,12 +27,14 @@
 
 ### 💬 AI 问答侧栏
 - 文章右侧内嵌对话面板，提问自动附带当前章节全文（≤8000 字符）
-- 多轮追问（带最近 5 轮历史），流式输出，Markdown 渲染
-- 每期对话独立存档，收起面板/切期/重启都不丢；可一键清空
-- 面板宽度可拖拽调节（260~720px），宽度记忆
+- 多轮追问（带最近 5 轮历史），流式输出，Markdown 安全渲染（加粗/斜体/标题/列表）
+- 每期对话独立存档，收起面板/切期/重启 App 都不丢；可一键清空
+- 面板宽度可拖拽调节（260~720px），宽度记忆；开合状态完全由用户控制，换文章不自动弹开
 
 ### 🧩 其他
-- 弹窗可拖拽、可折叠，不挡正文
+- 划词弹卡一体化把手条：拖动、内容摘要、折叠三合一；折叠后缩为一条标题条，不再有孤立小按钮
+- **状态持久化到文件**：AI 对话存档、「已存」徽标、阅读进度、偏好设置（字号/PDF 模式/侧栏宽度）全部保存在本地状态文件中，彻底根治"重启丢状态"；首次运行自动迁移 localStorage 旧数据
+- **GitHub API 自动认证**：检测到 GitHub CLI 登录时自动携带其 token（限额 60 → 5000 次/小时，运行时读取凭据，不存储不写库）；配合全仓 Trees API + ETag 304 缓存，日常刷新几乎零配额消耗
 - 渲染错误兜底：组件崩溃降级为错误横幅 + 重试，绝不白屏
 - 中英双语界面，跟随 Harness 主题（`--dsw-alias-*` tokens）
 
@@ -114,10 +116,11 @@ notepad "$env:DSH_PROFILE_DIR\cordis.patch.yml"
 
 ## 🔧 技术要点
 
-- **零依赖 Host 半区**：GitHub Contents API 拉取期号索引（10 分钟缓存 + 请求去重），自研 zip/epub 解析器（central directory + inflateRaw），spine/NCX/nav 目录合成与 calibre 惯例标题提取
+- **零依赖 Host 半区**：GitHub Git Trees API 一次请求拉取全仓期号树（ETag 304 缓存，未变更零配额），自研 zip/epub 解析器（central directory + inflateRaw），spine/NCX/nav 目录合成与 calibre 惯例标题提取（含实体二次解码与转义标签还原）
 - **AI 能力走 Harness 原生管道**：`ctx.llm`（provider 无关），自动适配 thinking 模型的 reasoning effort 要求；翻译/问答双通道，多轮历史折叠为对话记录避免 adapter 校验问题
 - **安全**：章节 HTML 服务端净化（script/iframe/事件属性剥离），图片走同源代理路由（扩展名白名单），Markdown 渲染先转义后白名单重建，外链弹卡自动匹配本地章节
-- **缓存策略**：期号索引（内存 10min）、epub/PDF（磁盘，tmp）、翻译（内存 Map + localStorage 双层）、章节解析（内存）
+- **状态持久化**：`/jr/api/state` 键值 API + 本地 JSON 文件（防抖合并写），客户端读写自动迁移 localStorage 旧数据
+- **缓存策略**：全仓期号树（状态文件 + ETag）、epub/PDF（磁盘，tmp）、翻译（内存 Map + localStorage 双层）、章节解析（内存）
 
 ## 📄 文件结构
 
