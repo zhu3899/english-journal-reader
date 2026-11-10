@@ -4,7 +4,8 @@
 
 > 别的阅读器只能"看"，它能"问"。
 
-![icon](icon.svg)
+<img width="1410" height="1303" alt="image" src="https://github.com/user-attachments/assets/c19c1a34-4f09-40df-8ef3-7683558e987a" />
+
 
 ## ✨ 功能
 
