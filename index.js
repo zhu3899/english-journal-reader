@@ -1198,6 +1198,49 @@ async function handleVoices(ctx, res) {
 	}
 }
 
+// —— 词典查询 ——
+// 浏览器直连 api.dictionaryapi.dev 常被代理/防火墙拦下（表现为 Failed to fetch），
+// 而 Host 侧走 Node 的网络栈通常没问题。放在服务端更稳，也顺带避开 CORS。
+const DICT_API = 'https://api.dictionaryapi.dev/api/v2/entries/en/';
+const dictCache = new Map();
+const DICT_TTL_MS = 10 * 60 * 1000;
+
+async function handleDict(ctx, url, res) {
+	const word = (url.searchParams.get('word') || '').trim();
+	if (!word) return fail(res, 'empty word', 400);
+	if (!/^[A-Za-z][A-Za-z'’-]{0,40}$/.test(word)) return fail(res, 'invalid word', 400);
+	const key = word.toLowerCase();
+	const hit = dictCache.get(key);
+	if (hit && Date.now() - hit.at < DICT_TTL_MS) {
+		sendJson(res, 200, hit.value);
+		return;
+	}
+	try {
+		// 这个免费接口偶尔首次响应很慢，超时给足 20 秒。
+		const upstream = await fetch(DICT_API + encodeURIComponent(word), {
+			headers: {
+				accept: 'application/json',
+				'user-agent': 'dsh-journal-reader-plugin (+https://github.com/hehonghui/awesome-english-ebooks)'
+			},
+			signal: AbortSignal.timeout(20000)
+		});
+		if (upstream.status === 404) {
+			sendJson(res, 200, { found: false, entries: [] });
+			return;
+		}
+		if (!upstream.ok) {
+			fail(res, `dictionary API HTTP ${upstream.status}`, 502);
+			return;
+		}
+		const entries = await upstream.json();
+		const value = { found: Array.isArray(entries) && entries.length > 0, entries: Array.isArray(entries) ? entries : [] };
+		dictCache.set(key, { at: Date.now(), value });
+		sendJson(res, 200, value);
+	} catch (error) {
+		fail(res, `dictionary lookup failed: ${error.message || error}`, 502);
+	}
+}
+
 async function handleSpeech(ctx, req, res) {
 	let body;
 	try {
@@ -1291,6 +1334,7 @@ async function handle(ctx, req, res) {
 		if (route === '/pdf') return await handlePdf(ctx, url, res);
 		if (route === '/asset') return await handleAsset(ctx, url, res);
 		if (route === '/explain') return await handleExplain(ctx, url, res, req);
+		if (route === '/dict') return await handleDict(ctx, url, res);
 		if (route === '/voices') return await handleVoices(ctx, res);
 		fail(res, 'not found', 404);
 	} catch (error) {

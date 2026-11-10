@@ -1334,12 +1334,24 @@ window.__ModuleLoader__.load({
 				abortRef.current = controller;
 				try {
 					if (kind === 'dict') {
-						const res = await fetch(`https://api.dictionaryapi.dev/api/v2/entries/en/${encodeURIComponent(popup.text)}`, { signal: controller.signal });
-						if (!res.ok) { setContent(t('wordNotFound')); }
-						else {
-							const entries = await res.json();
+						// 走 Host 代理而不是浏览器直连：直连常被代理/防火墙拦下。
+						const res = await fetch(`/jr/api/dict?word=${encodeURIComponent(popup.text)}`, { signal: controller.signal });
+						if (!res.ok) {
+							let message = `HTTP ${res.status}`;
+							try {
+								const data = await res.json();
+								if (data && data.error) message = data.error;
+							} catch {}
+							throw new Error(message);
+						}
+						const data = await res.json();
+						const entries = Array.isArray(data.entries) ? data.entries : [];
+						if (!data.found || entries.length === 0) {
+							setContent(t('wordNotFound'));
+							setDictParts([]);
+						} else {
 							const parts = [];
-							for (const entry of Array.isArray(entries) ? entries.slice(0, 2) : []) {
+							for (const entry of entries.slice(0, 2)) {
 								if (entry.phonetic || (entry.phonetics || []).some((p) => p.text)) {
 									parts.push({ kind: 'phon', text: entry.phonetic || entry.phonetics.find((p) => p.text)?.text });
 								}
