@@ -56,6 +56,7 @@ window.__ModuleLoader__.load({
 			chat: 'AI 问答',
 			chatPlaceholder: '就这篇文章提问…（Enter 发送，Shift+Enter 换行）',
 			chatHint: '提问会自动附带当前章节内容。例如：总结这篇文章、第三段是什么意思？',
+			chatThinking: '正在思考…',
 			send: '发送',
 			chatHide: '收起面板（对话自动保存，随时可回来看）',
 			chatClear: '清空本期的对话记录',
@@ -116,6 +117,7 @@ window.__ModuleLoader__.load({
 			chat: 'AI chat',
 			chatPlaceholder: 'Ask about this article… (Enter to send, Shift+Enter for newline)',
 			chatHint: 'Questions automatically include the current chapter. Try: summarize this, what does paragraph 3 mean?',
+			chatThinking: 'Thinking…',
 			send: 'Send',
 			chatHide: 'Hide panel (the conversation is saved automatically)',
 			chatClear: 'Clear this issue\'s conversation',
@@ -222,6 +224,8 @@ window.__ModuleLoader__.load({
 			'.jr-chat-msg strong{font-weight:650}',
 			'.jr-chat-user{align-self:flex-end;background:var(--dsw-alias-bg-layer-2);border-radius:10px;padding:8px 10px;max-width:88%}',
 			'.jr-chat-bot{align-self:stretch}',
+			'.jr-chat-thinking{display:flex;align-items:center;flex-wrap:wrap;color:var(--dsw-alias-label-secondary);font-size:13px}',
+			'.jr-chat-reasoning{width:100%;margin-top:6px;padding:6px 8px;border-left:2px solid var(--dsw-alias-border-l2);color:var(--dsw-alias-label-secondary);font-size:12px;line-height:1.6;white-space:pre-wrap;opacity:.75}',
 			'.jr-chat-input{display:flex;gap:8px;padding:10px 12px;border-top:1px solid var(--dsw-alias-border-l1);align-items:flex-end}',
 			'.jr-chat-input textarea{flex:1;resize:none;border:1px solid var(--dsw-alias-border-l2);border-radius:8px;background:var(--dsw-alias-bg-base);color:var(--dsw-alias-label-primary);font:inherit;font-size:13px;padding:6px 8px;min-height:46px}',
 			'.jr-drag:active{cursor:grabbing}',
@@ -1181,6 +1185,40 @@ window.__ModuleLoader__.load({
 			);
 		}
 
+		/**
+		 * 读取 Host 的分帧响应（ndjson）。
+		 * 每一帧是 { type: 'text' | 'reasoning' | 'done', text }。
+		 * 思考与正文分开回调，客户端可以在思考期间就给出反馈。
+		 */
+		async function streamFrames(res, onText, onReasoning) {
+			const reader = res.body && res.body.getReader ? res.body.getReader() : null;
+			if (!reader) {
+				// 没有流式响应时按整段处理（兼容降级路径）。
+				const text = await res.text();
+				if (text) onText(text);
+				return text;
+			}
+			const decoder = new TextDecoder();
+			let pending = '';
+			let text = '';
+			for (;;) {
+				const { done, value } = await reader.read();
+				if (done) break;
+				pending += decoder.decode(value, { stream: true });
+				let index;
+				while ((index = pending.indexOf('\n')) >= 0) {
+					const line = pending.slice(0, index).trim();
+					pending = pending.slice(index + 1);
+					if (!line) continue;
+					let frame;
+					try { frame = JSON.parse(line); } catch { continue; }
+					if (frame.type === 'text') { text += frame.text || ''; onText(text); }
+					else if (frame.type === 'reasoning') { onReasoning?.(frame.text || ''); }
+				}
+			}
+			return text;
+		}
+
 		async function streamBody(res, onChunk) {
 			const reader = res.body && res.body.getReader ? res.body.getReader() : null;
 			if (!reader) {
@@ -1789,9 +1827,14 @@ window.__ModuleLoader__.load({
 								const data = await res.json().catch(() => ({}));
 								throw new Error(data.error || `HTTP ${res.status}`);
 							}
-							const final = await streamBody(res, (acc) => {
-								setChat((c) => c && ({ ...c, msgs: c.msgs.map((m, i) => (i === c.msgs.length - 1 && m.role === 'assistant' ? { ...m, text: acc } : m)) }));
-							});
+							const final = await streamFrames(res,
+								(acc) => {
+									setChat((c) => c && ({ ...c, msgs: c.msgs.map((m, i) => (i === c.msgs.length - 1 && m.role === 'assistant' ? { ...m, text: acc } : m)) }));
+								},
+								(reasoning) => {
+									// 思考过程单独累积，界面显示「正在思考…」而不是空白等待。
+									setChat((c) => c && ({ ...c, msgs: c.msgs.map((m, i) => (i === c.msgs.length - 1 && m.role === 'assistant' ? { ...m, reasoning } : m)) }));
+								});
 							setChat((c) => c && ({ ...c, busy: false, msgs: c.msgs.map((m, i) => (i === c.msgs.length - 1 && m.role === 'assistant' ? { role: 'assistant', text: final } : m)) }));
 						} catch (err) {
 							if (controller.signal.aborted) return;
@@ -2054,7 +2097,18 @@ window.__ModuleLoader__.load({
 					msgs.length === 0 ? h('div', { className: 'jr-hint' }, t('chatHint')) : null,
 					msgs.map((m, i) => m.role === 'user'
 						? h('div', { key: i, className: 'jr-chat-msg jr-chat-user' }, m.text)
-						: h('div', { key: i, className: 'jr-chat-msg jr-chat-bot', dangerouslySetInnerHTML: { __html: renderMarkdown(m.text) } }))),
+						: h('div', { key: i, className: 'jr-chat-msg jr-chat-bot' },
+							// 思考过程：正文还没出来时，先显示正在思考的提示。
+							m.streaming && !m.text && m.reasoning
+								? h('div', { className: 'jr-chat-thinking' },
+									h('span', { className: 'jr-spin', style: { width: 12, height: 12, marginRight: 6 } }),
+									h('span', null, t('chatThinking')),
+									m.reasoning.length > 120
+										? h('div', { className: 'jr-chat-reasoning' }, m.reasoning.slice(-120))
+										: null)
+								: null,
+							m.text ? h('div', { dangerouslySetInnerHTML: { __html: renderMarkdown(m.text) } }) : null
+						))),
 				h('form', { className: 'jr-chat-input', onSubmit: (e) => { e.preventDefault(); const el = chatInputRef.current; if (!el) return; const v = el.value; el.value = ''; onSend(v); } },
 					h('textarea', {
 						ref: chatInputRef, rows: 2, placeholder: t('chatPlaceholder'),

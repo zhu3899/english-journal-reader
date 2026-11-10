@@ -991,9 +991,14 @@ async function handleAsk(ctx, req, res) {
 	req.on('aborted', onAbort);
 	res.on('close', onAbort);
 	res.statusCode = 200;
-	res.setHeader('content-type', 'text/plain; charset=utf-8');
+	res.setHeader('content-type', 'application/x-ndjson; charset=utf-8');
 	res.setHeader('cache-control', 'no-store');
 	let finish;
+	// 思考过程与正文分帧下发：thinking 模型在给出正文前会思考十几秒，
+	// 把 reasoning-delta 一并转发，客户端就能立刻显示「正在思考」而不是干等。
+	const send = (frame) => {
+		if (!res.writableEnded) res.write(JSON.stringify(frame) + '\n');
+	};
 	try {
 		const sysText = '你是资深英语外刊精读助教。学生正在阅读英文外刊，请用中文回答他们关于文章的问题：解释词汇、语法、背景，或按要求总结、翻译。回答紧扣给出的文章片段；片段之外的信息请注明是背景知识。'
 			+ (context ? '\n\n【当前文章片段】\n' + context : '');
@@ -1016,19 +1021,25 @@ async function handleAsk(ctx, req, res) {
 		};
 		for await (const chunk of llm.stream(request_)) {
 			if (aborted) break;
-			if (chunk && chunk.type === 'text-delta' && typeof chunk.text === 'string') res.write(chunk.text);
-			else if (chunk && chunk.type === 'finish') finish = chunk.reason;
+			if (chunk && chunk.type === 'text-delta' && typeof chunk.text === 'string') {
+				send({ type: 'text', text: chunk.text });
+			} else if (chunk && chunk.type === 'reasoning-delta' && typeof chunk.text === 'string') {
+				send({ type: 'reasoning', text: chunk.text });
+			} else if (chunk && chunk.type === 'finish') finish = chunk.reason;
 		}
 		if (!aborted && finish && finish.kind === 'error') {
 			const note = finish.failure?.message ? `\n\n[回答失败：${finish.failure.message}]` : '\n\n[回答失败]';
-			res.write(note);
+			send({ type: 'text', text: note });
 		}
 	} catch (error) {
-		if (!aborted) res.write(`\n\n[回答失败：${error.message || error}]`);
+		if (!aborted) send({ type: 'text', text: `\n\n[回答失败：${error.message || error}]` });
 	} finally {
 		req.off('aborted', onAbort);
 		res.off('close', onAbort);
-		if (!res.writableEnded) res.end();
+		if (!res.writableEnded) {
+			res.write(JSON.stringify({ type: 'done' }) + '\n');
+			res.end();
+		}
 	}
 }
 
