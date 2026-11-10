@@ -63,7 +63,18 @@ window.__ModuleLoader__.load({
 			transLoading: '翻译中…',
 			dual: '对照',
 			pdf: 'PDF',
-			textMode: '文字版'
+			textMode: '文字版',
+			readAloud: '朗读',
+			speechPlay: '播放',
+			speechPause: '暂停',
+			speechStop: '停止',
+			speechPrev: '上一句',
+			speechNext: '下一句',
+			speechAuto: '自动音色',
+			speechRate: '语速',
+			speechVoice: '音色',
+			speechLoading: '合成中…',
+			speechCloudGroup: '云端神经语音'
 		};
 		const en = {
 			panel: 'Journal Reader',
@@ -112,7 +123,18 @@ window.__ModuleLoader__.load({
 			transLoading: 'Translating…',
 			dual: 'Bilingual',
 			pdf: 'PDF',
-			textMode: 'Text'
+			textMode: 'Text',
+			readAloud: 'Read aloud',
+			speechPlay: 'Play',
+			speechPause: 'Pause',
+			speechStop: 'Stop',
+			speechPrev: 'Previous sentence',
+			speechNext: 'Next sentence',
+			speechAuto: 'Auto voice',
+			speechRate: 'Speed',
+			speechVoice: 'Voice',
+			speechLoading: 'Synthesizing…',
+			speechCloudGroup: 'Cloud neural voices'
 		};
 
 		const CSS = [
@@ -211,7 +233,27 @@ window.__ModuleLoader__.load({
 			'.jr-dict-phon{color:var(--dsw-alias-label-secondary);margin-left:8px;font-size:12px}',
 			'.jr-dict-pos{color:var(--dsw-alias-brand-primary);font-style:italic;margin-top:8px}',
 			'.jr-dict-def{margin:2px 0 0 12px}',
-			'.jr-hint{color:var(--dsw-alias-label-secondary);font-size:12px;padding:8px 2px 2px}'
+			'.jr-hint{color:var(--dsw-alias-label-secondary);font-size:12px;padding:8px 2px 2px}',
+			// —— 朗读（Web Speech API）——
+			'.jr-speak-bar{display:flex;align-items:center;gap:6px;flex:none;padding:6px 10px;border-bottom:1px solid var(--dsw-alias-border-l1);background:var(--dsw-alias-bg-layer-1);flex-wrap:wrap}',
+			'.jr-speak-btn{appearance:none;border:1px solid var(--dsw-alias-border-l2);background:var(--dsw-alias-bg-base);color:var(--dsw-alias-label-primary);border-radius:8px;padding:3px 10px;font-size:12px;cursor:pointer;line-height:1.5}',
+			'.jr-speak-btn:hover:not(:disabled){background:var(--dsw-alias-bg-layer-2)}',
+			'.jr-speak-btn:disabled{opacity:.45;cursor:default}',
+			'.jr-speak-btn[data-active="true"]{background:var(--dsw-alias-brand-primary);border-color:transparent;color:#fff}',
+			'.jr-speak-icon{appearance:none;border:0;background:none;color:var(--dsw-alias-label-primary);cursor:pointer;padding:2px 4px;font-size:14px;line-height:1;display:inline-flex;align-items:center}',
+			'.jr-speak-icon:hover:not(:disabled){color:var(--dsw-alias-brand-primary)}',
+			'.jr-speak-icon:disabled{opacity:.35;cursor:default}',
+			'.jr-speak-select{appearance:none;border:1px solid var(--dsw-alias-border-l2);background:var(--dsw-alias-bg-base);color:var(--dsw-alias-label-primary);border-radius:8px;padding:3px 6px;font-size:12px;cursor:pointer;max-width:160px}',
+			'.jr-speak-rate{display:flex;align-items:center;gap:6px;font-size:12px;color:var(--dsw-alias-label-secondary)}',
+			'.jr-speak-rate input[type="range"]{width:88px;accent-color:var(--dsw-alias-brand-primary);cursor:pointer}',
+			'.jr-speak-status{font-size:12px;color:var(--dsw-alias-label-secondary);margin-left:auto;white-space:nowrap}',
+			'.jr-speak-progress{font-variant-numeric:tabular-nums;color:var(--dsw-alias-label-secondary);font-size:12px}',
+			// 朗读高亮：句子级标记，跟随朗读进度
+			'.jr-sentence{border-radius:3px;transition:background-color .12s}',
+			'.jr-sentence[data-state="active"]{background-color:color-mix(in srgb,var(--dsw-alias-brand-primary) 28%,transparent);box-shadow:inset 0 -2px 0 var(--dsw-alias-brand-primary)}',
+			'.jr-sentence[data-state="done"]{background-color:var(--dsw-alias-bg-layer-2)}',
+			'.jr-para-btn[data-role="speak"]{right:auto;left:0;top:-12px}',
+			'.jr-speak-word{text-decoration:underline dotted var(--dsw-alias-brand-primary);text-underline-offset:3px;cursor:pointer}'
 		].join('\n');
 
 		function insertStyles(css) {
@@ -288,6 +330,764 @@ window.__ModuleLoader__.load({
 			}
 			return `我在阅读英文外刊时遇到这个句子，请帮我精读讲解：先拆解语法结构（主干与修饰成分），再讲关键词汇与地道表达，最后补充必要的背景知识。请用中文。\n\n句子：${text}`;
 		}
+
+		// —— 朗读（Web Speech API）：句子切分 + 引擎 ——
+		// 缩写表：命中这些词时，句末的句点不切句（"Dr. Smith went home."）。
+		const ABBR_ANY = new Set([
+			'mr', 'mrs', 'ms', 'dr', 'prof', 'sr', 'jr', 'st', 'mt', 'vs', 'etc', 'eg', 'ie',
+			'al', 'approx', 'inc', 'ltd', 'co', 'corp', 'dept', 'univ', 'assn', 'bros', 'phd',
+			'md', 'ba', 'ma', 'bsc', 'msc', 'esp', 'viz', 'ibid', 'cf', 'ca'
+		]);
+		// 这些词只有在首字母大写时才算缩写（句末的 "no." 是句子，"No. 5" 是编号）。
+		const ABBR_UPPER = new Set([
+			'no', 'fig', 'vol', 'art', 'gen', 'gov', 'mar', 'dec', 'jan', 'feb', 'apr', 'jun',
+			'jul', 'aug', 'sep', 'sept', 'oct', 'nov', 'mont', 'ave', 'blvd', 'rd', 'lt', 'col',
+			'capt', 'maj', 'rev', 'hon', 'supt', 'msgr', 'est', 'min', 'max', 'avg', 'ph', 'fr'
+		]);
+
+		function endsWithAbbreviation(head) {
+			const m = /([A-Za-z][A-Za-z.]*)\.$/.exec(String(head).trim());
+			if (!m) return false;
+			const raw = m[1];
+			const word = raw.toLowerCase();
+			if (raw.indexOf('.') >= 0) return true;   // U.S. / Ph.D. / e.g.
+			if (raw.length === 1) return true;         // J. Smith
+			if (ABBR_ANY.has(word)) return true;
+			if (ABBR_UPPER.has(word) && raw[0] === raw[0].toUpperCase()) return true;
+			return false;
+		}
+
+		/** 把超长句在逗号处再切一刀：单条 utterance 过长时浏览器会截断音频。 */
+		/**
+		 * 把过长的句子在逗号处再切一刀：单条 utterance 过长时浏览器会截断音频。
+		 *
+		 * 切点绝不能落在 UTF-16 代理对中间——emoji 会被劈成两半，
+		 * 拼回去时中间多一个空格，就变成了 Python 无法编码的孤立代理项。
+		 */
+		function splitLong(piece) {
+			if (piece.length <= 260) return [piece];
+			const parts = [];
+			let rest = piece;
+			const safeCut = (index) => {
+				// index 落在高代理之后时，后退一格让整个代理对留在前一段。
+				const code = piece.charCodeAt(index - 1);
+				if (index > 0 && code >= 0xd800 && code <= 0xdbff) return index - 1;
+				return index;
+			};
+			while (rest.length > 260) {
+				const window = rest.slice(0, 300);
+				let cut = window.lastIndexOf(', ');
+				if (cut < 120) cut = window.lastIndexOf('; ');
+				if (cut < 120) {
+					const at = safeCut(260);
+					parts.push(rest.slice(0, at));
+					rest = rest.slice(at);
+					continue;
+				}
+				const at = safeCut(cut + 1);
+				parts.push(rest.slice(0, at));
+				rest = rest.slice(at);
+			}
+			if (rest.trim()) parts.push(rest);
+			// 不在这里 trim：句子之间的空格正是靠它保留的。
+			return parts.filter((p) => p.trim());
+		}
+
+		/**
+		 * 按句末标点切句，避开缩写、小数与引号后的空格。
+		 *
+		 * **片段保留原始空白**：切句不能丢掉任何空格。
+		 *  - 同一文本节点内切分：空白留在前一片的尾部（"Congress. In" 而不是 "Congress.In"）
+		 *  - 跨标签边界：每个文本节点独立切分时，节点首尾的空白必须留在原处，
+		 *    否则 "<a>James Talarico</a> became" 会粘成 "Talaricobecame"。
+		 *
+		 * 返回的片段是「原文片段」，朗读时再各自 trim。
+		 */
+		function splitSentences(text) {
+			const source = String(text == null ? '' : text);
+			if (!source.trim()) return [];
+			// 记录首尾空白，切分完再放回去。
+			const leading = source.match(/^\s*/)[0];
+			const trailing = source.match(/\s*$/)[0];
+			const core = source.slice(leading.length, source.length - trailing.length);
+			if (!core) return [];
+
+			const out = [];
+			let start = 0;
+			const re = /[.!?…]+["'”’»)\]]*/g;
+			let match;
+			while ((match = re.exec(core)) !== null) {
+				const end = match.index + match[0].length;
+				const before = core[match.index - 1];
+				// 句点前必须是字母：排除小数、金额与纯数字。
+				if (before === undefined || !/[A-Za-z]/.test(before)) continue;
+				const after = core[end];
+				if (after !== undefined && !/\s/.test(after)) continue;
+				const head = core.slice(start, match.index);
+				const punct = /[.!?…]$/.test(head) ? head : head + '.';
+				if (endsWithAbbreviation(punct)) continue;
+				// 切点到下一句之间的空白跟着前一片走，渲染时才不会丢。
+				let next = end;
+				while (next < core.length && /\s/.test(core[next])) next++;
+				const piece = core.slice(start, next);
+				if (piece.trim()) out.push(piece);
+				start = next;
+			}
+			if (start < core.length) {
+				const tail = core.slice(start);
+				if (tail.trim()) out.push(tail);
+			}
+			if (out.length === 0) return [leading + core + trailing];
+			// 首片带上前导空白，末片带上尾部空白。
+			out[0] = leading + out[0];
+			out[out.length - 1] = out[out.length - 1] + trailing;
+			return out.flatMap(splitLong);
+		}
+
+		/**
+		 * 把已渲染的正文按句拆成 <span class="jr-sentence">，
+		 * 返回 [{ text, el, root }]，供朗读队列与高亮共用。
+		 * 按 DOM 文档顺序收集，朗读顺序才与视觉顺序一致。
+		 * 幂等：已经标注过的容器直接复用现有标记（React 不会重写内容未变的
+		 * dangerouslySetInnerHTML，所以标记会一直留在 DOM 里）。
+		 */
+		function annotateSentences(container) {
+			const result = { sentences: [] };
+			if (!container || typeof document === 'undefined') return result;
+			const existing = Array.from(container.querySelectorAll('.jr-sentence'));
+			if (existing.length) {
+				for (const el of existing) {
+					result.sentences.push({ text: el.textContent || '', el, root: el.parentElement });
+				}
+				return result;
+			}
+			const roots = [];
+			for (const child of Array.from(container.children)) {
+				if (child.classList.contains('jr-para')) {
+					// 段落块：真正承载 HTML 的内层 div。
+					const inner = child.querySelector(':scope > div');
+					if (inner) roots.push(inner);
+					continue;
+				}
+				if (child.classList.contains('jr-center') || child.classList.contains('jr-error')) continue;
+				if (child.classList.contains('jr-empty')) continue;
+				if (child.tagName !== 'DIV') continue;
+				roots.push(child);
+			}
+			for (const root of roots) {
+				const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
+					acceptNode(node) {
+						const value = node.nodeValue || '';
+						if (!value.trim()) return NodeFilter.FILTER_REJECT;
+						const parent = node.parentElement;
+						if (!parent) return NodeFilter.FILTER_REJECT;
+						if (parent.closest('.jr-sentence')) return NodeFilter.FILTER_REJECT;
+						if (parent.closest('script, style, noscript, button, textarea, input, select')) return NodeFilter.FILTER_REJECT;
+						return NodeFilter.FILTER_ACCEPT;
+					}
+				});
+				const nodes = [];
+				for (let node = walker.nextNode(); node; node = walker.nextNode()) nodes.push(node);
+				for (const node of nodes) {
+					const parts = splitSentences(node.nodeValue);
+					if (parts.length === 0) continue;
+					const frag = document.createDocumentFragment();
+					for (const part of parts) {
+						const span = document.createElement('span');
+						span.className = 'jr-sentence';
+						span.textContent = part;
+						frag.appendChild(span);
+						// 朗读与对齐用 trim 过的文本；渲染用的元素保留原始空白。
+						result.sentences.push({ text: part.trim(), el: span, root });
+					}
+					if (node.parentNode) node.parentNode.replaceChild(frag, node);
+				}
+			}
+			return result;
+		}
+
+		/** PDF 模式下没有可高亮的正文，直接从段落文本切句。 */
+		function sentencesFromBlocks(blocks) {
+			const out = [];
+			for (const block of blocks || []) {
+				if (block.type !== 'para' || !block.text) continue;
+				for (const sentence of splitSentences(block.text)) {
+					// 朗读用 trim 过的文本，和 DOM 路径保持一致。
+					out.push({ text: sentence.trim(), el: null, root: null });
+				}
+			}
+			return out;
+		}
+
+		const SpeakerIcon = () => h('svg', {
+			viewBox: '0 0 20 20', width: 15, height: 15, 'aria-hidden': true,
+			style: { display: 'block' }
+		},
+			h('path', {
+				d: 'M4 7.5h2.6L10 4.6v10.8L6.6 12.5H4z',
+				fill: 'currentColor', stroke: 'currentColor', strokeWidth: 1.1, strokeLinejoin: 'round'
+			}),
+			h('path', {
+				d: 'M12.6 7.2a3.6 3.6 0 0 1 0 5.6M14.6 5.4a6.4 6.4 0 0 1 0 9.2',
+				fill: 'none', stroke: 'currentColor', strokeWidth: 1.4, strokeLinecap: 'round'
+			})
+		);
+
+		/**
+		 * 朗读引擎（Edge TTS 云端神经语音）。
+		 *
+		 * 一次请求拿到一段音频和逐句时间戳，所以高亮按真实时间轴推进，
+		 * 而不是「念完一句再跳下一句」。
+		 *
+		 * 数据流：
+		 *   /jr/api/speech → ndjson 帧 → 音频块解码成 Blob → Audio 播放
+		 *   帧里的 boundary 事件给出每句的 offset/duration，用它算当前该高亮哪句。
+		 *
+		 * 分段：整章一次性合成要 40 秒以上，首句迟迟听不到。改为按段合成、
+		 * 边播边合成下一段——合成速度约为朗读速度的 7 倍，来得及供给。
+		 */
+		const SEGMENT_CHARS = 700;
+
+		const CloudSpeechEngine = class {
+			constructor() {
+				this.status = 'idle';
+				this.index = -1;
+				this.total = 0;
+				this.rate = 1;
+				this.voiceURI = '';
+				this.voices = [];
+				this.error = null;
+				this.listeners = new Set();
+				this.audio = null;
+				this.objectUrl = null;
+				this.timings = [];
+				this.sentences = [];
+				this.controllers = new Set();
+				// 分段播放的状态
+				this.segments = [];
+				this.segmentFirstIndex = [];
+				this.segmentIndex = 0;
+				this.segmentBase = 0;      // 当前段在全局时间轴上的起点（秒）
+				this.synthPromises = new Map();
+				this.playToken = 0;        // 每次 play() 自增，淘汰过期的异步结果
+				this.segmentSynthRate = 1; // 当前段合成时用的语速，用来算 playbackRate 补偿
+			}
+			subscribe(fn) {
+				this.listeners.add(fn);
+				return () => { this.listeners.delete(fn); };
+			}
+			emit() {
+				const snap = this.snapshot();
+				for (const fn of Array.from(this.listeners)) {
+					try { fn(snap); } catch {}
+				}
+			}
+			snapshot() {
+				return {
+					status: this.status,
+					index: this.index,
+					total: this.total,
+					rate: this.rate,
+					voiceURI: this.voiceURI,
+					voices: this.voices,
+					error: this.error
+				};
+			}
+			/**
+			 * 设置语速。
+			 *
+			 * 合成时用的是 edge_tts 的 rate 参数（声音自然），但那要等下一段合成
+			 * 才生效。所以当前正在播的这一段用 playbackRate 立刻补偿：
+			 *   实际语速 = 合成时的 rate × playbackRate
+			 * 把 playbackRate 设成 新语速 / 本段合成语速，当前段就立刻变速；
+			 * 下一段则直接用新语速合成。两者衔接处的实际语速是一致的。
+			 */
+			setRate(rate) {
+				const next = Math.min(2, Math.max(0.5, Number(rate) || 1));
+				if (next === this.rate) return;
+				const previous = this.rate;
+				this.rate = next;
+				if (this.audio && this.segmentSynthRate > 0) {
+					const playbackRate = next / this.segmentSynthRate;
+					try { this.audio.playbackRate = playbackRate; } catch {}
+					// 本段时间戳是按旧 playbackRate 铺的，现在要按新倍率重新缩放，
+					// 否则高亮会和声音错位。
+					const firstIndex = this.segmentFirstIndex[this.segmentIndex] ?? 0;
+					const count = this.segments[this.segmentIndex]?.length ?? 0;
+					const scale = previous / next;
+					for (let i = 0; i < count; i++) {
+						const timing = this.timings[firstIndex + i];
+						if (!timing) continue;
+						const relative = timing.offset - this.segmentBase;
+						this.timings[firstIndex + i] = {
+							offset: this.segmentBase + relative * scale,
+							duration: timing.duration * scale
+						};
+					}
+				}
+				// 已经预取的那段是按旧语速合成的，语速变了就得丢掉重合成。
+				if (this.synthPromises.size) {
+					this.synthPromises.clear();
+					this.prefetchSegment(this.segmentIndex + 1);
+				}
+				this.emit();
+			}
+			setVoice(voiceURI) {
+				this.voiceURI = voiceURI || '';
+				this.emit();
+			}
+			mark(index, state) {
+				const sentence = this.sentences[index];
+				if (sentence && sentence.el && sentence.el.isConnected) sentence.el.setAttribute('data-state', state);
+			}
+			clearMarks() {
+				for (const sentence of this.sentences) {
+					if (sentence && sentence.el && sentence.el.isConnected) sentence.el.removeAttribute('data-state');
+				}
+			}
+			/** 拉取云端音色表；失败时保留空列表，控制条会显示为无音色可选。 */
+			async loadVoices() {
+				try {
+					const res = await fetch('/jr/api/voices');
+					if (!res.ok) throw new Error(`HTTP ${res.status}`);
+					const data = await res.json();
+					this.voices = Array.isArray(data.voices) ? data.voices : [];
+					this.emit();
+					return this.voices;
+				} catch (error) {
+					this.error = String(error.message || error);
+					this.emit();
+					return [];
+				}
+			}
+			/**
+			 * 请求一段音频。返回 { blob, timings } —— timings 是与 sentences 同序的
+			 * { offset, duration } 列表，offset 单位为秒（相对本段起点）。
+			 */
+			async synthesize(text, voice, rate) {
+				const controller = new AbortController();
+				this.controllers.add(controller);
+				// 用「本次请求自己的 controller」判断取消，而不是共享标志：
+				// 共享标志在连续两次朗读时会串味——上一轮 abort 触发的拒绝，
+				// 可能撞上新一轮刚把标志清掉的时刻，被误判成真实故障。
+				const isAborted = () => controller.signal.aborted;
+				const chunks = [];
+				const timings = [];
+				let failure = null;
+				const handleFrame = (frame) => {
+					if (frame.type === 'audio') {
+						chunks.push(frame.data);
+					} else if (frame.type === 'boundary') {
+						timings.push({ offset: frame.offset, duration: frame.duration, text: frame.text });
+					} else if (frame.type === 'error') {
+						failure = new Error(frame.message || 'edge tts error');
+					}
+				};
+				// emoji 与符号无法朗读，还会打乱文本的时间戳对齐——直接去掉。
+				// 用 \u{...} 匹配整个代理对，避免只删掉一半留下孤立代理项。
+				const spoken = String(text || '')
+					.replace(/[\u{1F000}-\u{1FAFF}\u{2600}-\u{27BF}\u{FE0F}\u{200D}]/gu, ' ')
+					.replace(/\s{2,}/g, ' ')
+					.trim();
+				try {
+					const res = await fetch('/jr/api/speech', {
+						method: 'POST',
+						headers: { 'content-type': 'application/json' },
+						body: JSON.stringify({ text: spoken, voice, rate }),
+						signal: controller.signal
+					});
+					if (!res.ok) {
+						let message = `HTTP ${res.status}`;
+						try {
+							const data = await res.json();
+							if (data && data.error) message = data.error;
+						} catch {}
+						throw new Error(message);
+					}
+					const reader = res.body && res.body.getReader ? res.body.getReader() : null;
+					if (reader) {
+						const decoder = new TextDecoder();
+						let pending = '';
+						for (;;) {
+							const { done, value } = await reader.read();
+							if (done) break;
+							pending += decoder.decode(value, { stream: true });
+							let index;
+							while ((index = pending.indexOf('\n')) >= 0) {
+								const line = pending.slice(0, index).trim();
+								pending = pending.slice(index + 1);
+								if (!line) continue;
+								try { handleFrame(JSON.parse(line)); } catch {}
+							}
+						}
+					} else {
+						const text2 = await res.text();
+						for (const line of text2.split('\n')) {
+							const trimmed = line.trim();
+							if (!trimmed) continue;
+							try { handleFrame(JSON.parse(trimmed)); } catch {}
+						}
+					}
+					if (failure) throw failure;
+					if (!chunks.length) throw new Error('no audio returned');
+					const binary = chunks.map((c) => atob(c));
+					const bytes = new Uint8Array(binary.reduce((sum, part) => sum + part.length, 0));
+					let offset = 0;
+					for (const part of binary) {
+						for (let i = 0; i < part.length; i++) bytes[offset++] = part.charCodeAt(i);
+					}
+					return { blob: new Blob([bytes], { type: 'audio/mpeg' }), timings };
+				} catch (error) {
+					// 主动取消：Chromium 会抛 AbortError「BodyStreamBuffer was aborted」，
+					// 这是预期行为，不该当成错误上报。
+					if (isAborted()) return { blob: null, timings, aborted: true };
+					throw error;
+				} finally {
+					this.controllers.delete(controller);
+				}
+			}
+
+			/** 把句子切成若干段，每段不超过 SEGMENT_CHARS 字符。 */
+			segmentSentences(sentences) {
+				const segments = [];
+				let current = [];
+				let length = 0;
+				for (const sentence of sentences) {
+					const size = String(sentence.text || '').trim().length + 1;
+					if (current.length && length + size > SEGMENT_CHARS) {
+						segments.push(current);
+						current = [];
+						length = 0;
+					}
+					current.push(sentence);
+					length += size;
+				}
+				if (current.length) segments.push(current);
+				return segments;
+			}
+
+			/**
+			 * 合成一段，返回 { blob, timings, rate }；
+			 * timings 相对本段起点，rate 是这段实际使用的合成语速。
+			 */
+			async synthSegment(sentences) {
+				const text = sentences.map((s) => String(s.text || '').trim()).join(' ');
+				const rate = this.rate;
+				const result = await this.synthesize(text, this.voiceURI || 'en-US-AvaNeural', rate);
+				return { ...result, rate };
+			}
+			/** 预取下一段，让播放到段尾时音频已经就绪。 */
+			prefetchSegment(segmentIndex) {
+				if (segmentIndex >= this.segments.length) return;
+				if (this.synthPromises.has(segmentIndex)) return;
+				const token = this.playToken;
+				const sentences = this.segments[segmentIndex];
+				const promise = this.synthSegment(sentences)
+					.then((result) => {
+						// 播放已经被换掉了，丢弃这次结果。
+						if (token !== this.playToken) return null;
+						if (result && result.aborted) return null;
+						return result;
+					})
+					.catch((error) => {
+						if (token !== this.playToken) return null;
+						throw error;
+					});
+				this.synthPromises.set(segmentIndex, promise);
+			}
+			/** 把服务端的时间戳与本地句子对齐（服务端可能多切/少切几句）。 */
+			alignTimings(timings, sentences) {
+				const out = [];
+				let cursor = 0;
+				for (const sentence of sentences) {
+					const wanted = String(sentence.text || '').trim();
+					// 先在当前位置找文本完全一致的边界。
+					let found = -1;
+					for (let i = cursor; i < timings.length; i++) {
+						if (String(timings[i].text || '').trim() === wanted) { found = i; break; }
+					}
+					if (found < 0) {
+						// 再按前缀匹配（服务端可能带上尾部标点差异）。
+						for (let i = cursor; i < timings.length; i++) {
+							const text = String(timings[i].text || '').trim();
+							if (text && (wanted.startsWith(text) || text.startsWith(wanted))) { found = i; break; }
+						}
+					}
+					if (found < 0) { out.push(null); continue; }
+					cursor = found + 1;
+					out.push({ offset: timings[found].offset, duration: timings[found].duration });
+				}
+				return out;
+			}
+			async play(sentences, startIndex) {
+				if (!sentences || !sentences.length) return;
+				this.stopAudio();
+				this.playToken += 1;
+				const token = this.playToken;
+				this.sentences = sentences;
+				this.total = sentences.length;
+				this.error = null;
+				this.index = Math.max(0, Math.min(sentences.length - 1, Number(startIndex) || 0));
+				this.status = 'loading';
+				this.emit();
+
+				// 分段：整章一次性合成要 40 秒以上，首句迟迟听不到。
+				// 改为按段合成、播完一段立刻续下一段。
+				this.segments = this.segmentSentences(sentences);
+				this.segmentFirstIndex = [];
+				let cursor = 0;
+				for (const segment of this.segments) {
+					this.segmentFirstIndex.push(cursor);
+					cursor += segment.length;
+				}
+				this.segmentIndex = 0;
+				this.segmentBase = 0;
+				this.timings = [];
+
+				// 从包含 startIndex 的那一段开始播。
+				let startSegment = 0;
+				for (let i = 0; i < this.segmentFirstIndex.length; i++) {
+					if (this.segmentFirstIndex[i] <= this.index) startSegment = i;
+				}
+				this.segmentIndex = startSegment;
+
+				await this.playSegment(token, startSegment);
+			}
+
+			/**
+			 * 播放一段：合成 → 播放 → 结束时接下一段。
+			 * 合成失败就整段停下并报错。
+			 */
+			async playSegment(token, segmentIndex) {
+				if (token !== this.playToken) return;
+				const sentences = this.segments[segmentIndex];
+				if (!sentences) { this.finishPlayback(token); return; }
+
+				// 提前合成下一段，播到段尾时音频已就绪。
+				this.prefetchSegment(segmentIndex + 1);
+
+				let result;
+				try {
+					const pending = this.synthPromises.get(segmentIndex);
+					result = pending ? await pending : await this.synthSegment(sentences);
+				} catch (error) {
+					if (token !== this.playToken) return;
+					this.error = String(error.message || error);
+					this.status = 'idle';
+					this.emit();
+					return;
+				}
+				if (token !== this.playToken) return;
+				if (!result || result.aborted) return;   // 已被取消
+				if (!result.blob) {
+					this.error = 'no audio returned';
+					this.status = 'idle';
+					this.emit();
+					return;
+				}
+
+				// 本段的时间戳换算到全局时间轴。
+				// 本段合成时用的是 result.rate；如果播放时又改了语速（playbackRate 补偿），
+				// 时间戳要按 playbackRate 缩放，否则高亮会跟声音错位。
+				const synthRate = result.rate || this.rate;
+				const playbackRate = this.rate / synthRate;
+				const segmentTimings = this.alignTimings(result.timings, sentences);
+				const base = this.segmentBase;
+				const globalTimings = segmentTimings.map((timing) => (
+					timing
+						? { offset: timing.offset / playbackRate + base, duration: timing.duration / playbackRate }
+						: null
+				));
+				const firstIndex = this.segmentFirstIndex[segmentIndex] ?? 0;
+				for (let i = 0; i < globalTimings.length; i++) {
+					this.timings[firstIndex + i] = globalTimings[i];
+				}
+				// 兜底只针对**本段内**没对齐上的句子。
+				// 早先的写法会从 i=0 扫到整个数组，把前面段落已经填好的时间戳
+				// 全部改写成 { offset: last, duration: 0.2 }，高亮因此错位。
+				for (let i = firstIndex; i < firstIndex + globalTimings.length; i++) {
+					if (this.timings[i]) continue;
+					const previous = i > 0 ? this.timings[i - 1] : null;
+					this.timings[i] = previous
+						? { offset: previous.offset + previous.duration, duration: 0.2 }
+						: { offset: base, duration: 0.2 };
+				}
+
+				this.releaseAudio();
+				this.objectUrl = URL.createObjectURL(result.blob);
+				const audio = new Audio(this.objectUrl);
+				this.audio = audio;
+				// 这段是按 synthRate 合成的；若播放期间语速被改过，用 playbackRate 补偿。
+				this.segmentSynthRate = synthRate;
+				try { audio.playbackRate = playbackRate; } catch {}
+				audio.onended = () => {
+					if (this.audio !== audio) return;
+					this.nextSegment(token);
+				};
+				audio.onerror = () => {
+					if (this.audio !== audio) return;
+					this.error = 'audio playback failed';
+					this.status = 'idle';
+					this.emit();
+				};
+				try {
+					await audio.play();
+				} catch (error) {
+					if (token !== this.playToken) return;
+					this.error = String(error.message || error);
+					this.status = 'idle';
+					this.emit();
+					return;
+				}
+				if (token !== this.playToken) return;
+				this.status = 'playing';
+				this.tick();
+				this.emit();
+			}
+
+			/** 段结束：接下一段。 */
+			nextSegment(token) {
+				if (token !== this.playToken) return;
+				const next = this.segmentIndex + 1;
+				if (next >= this.segments.length) { this.finishPlayback(token); return; }
+				this.segmentIndex = next;
+				// 下一段的全局起点 = 上一段结束时的时间。
+				const previous = this.segmentFirstIndex[this.segmentIndex - 1] ?? 0;
+				const previousCount = this.segments[this.segmentIndex - 1].length;
+				let base = this.segmentBase;
+				for (let i = 0; i < previousCount; i++) {
+					const timing = this.timings[previous + i];
+					if (timing) base = Math.max(base, timing.offset + timing.duration);
+				}
+				this.segmentBase = base;
+				this.playSegment(token, next);
+			}
+
+			finishPlayback(token) {
+				if (token !== this.playToken) return;
+				this.status = 'done';
+				this.emit();
+			}
+
+			/** 释放当前音频对象与 blob URL。 */
+			releaseAudio() {
+				if (this.audio) {
+					this.audio.onended = null;
+					this.audio.onerror = null;
+					try { this.audio.pause(); } catch {}
+					try { this.audio.src = ''; } catch {}
+					this.audio = null;
+				}
+				if (this.objectUrl) { URL.revokeObjectURL(this.objectUrl); this.objectUrl = null; }
+			}
+
+			/** 播放期间按真实时间轴推进高亮。 */
+			tick() {
+				if (this.status !== 'playing' || !this.audio) return;
+				// 用 audio.currentTime 而不是墙钟：改了 playbackRate 之后，
+				// currentTime 仍然是「音频播放到哪了」，墙钟却和声音脱节了。
+				const elapsed = this.segmentBase + this.audio.currentTime;
+				let active = -1;
+				for (let i = 0; i < this.timings.length; i++) {
+					const timing = this.timings[i];
+					if (!timing) continue;
+					if (elapsed >= timing.offset && elapsed < timing.offset + timing.duration) { active = i; break; }
+					if (elapsed >= timing.offset + timing.duration) active = i;
+				}
+				if (active >= 0 && active !== this.index) {
+					for (let i = 0; i < active; i++) this.mark(i, 'done');
+					this.mark(active, 'active');
+					const sentence = this.sentences[active];
+					if (sentence) this.scrollTo(sentence);
+					this.index = active;
+					this.emit();
+				}
+				this.raf = requestAnimationFrame(() => this.tick());
+			}
+			scrollTo(sentence) {
+				if (!sentence || !sentence.el || typeof sentence.el.scrollIntoView !== 'function') return;
+				const wrap = sentence.el.closest('.jr-article-wrap');
+				if (!wrap) return;
+				const rect = sentence.el.getBoundingClientRect();
+				const bounds = wrap.getBoundingClientRect();
+				if (rect.top >= bounds.top + 40 && rect.bottom <= bounds.bottom - 40) return;
+				sentence.el.scrollIntoView({ block: 'center', behavior: 'smooth' });
+			}
+			toggle() {
+				if (!this.audio) return;
+				if (this.status === 'playing') {
+					this.audio.pause();
+					this.status = 'paused';
+					this.emit();
+					return;
+				}
+				if (this.status === 'paused') {
+					// 用 audio.currentTime 做时间轴，暂停/恢复不需要任何补偿。
+					this.audio.play().catch(() => {});
+					this.status = 'playing';
+					this.tick();
+					this.emit();
+				}
+			}
+			jump(delta) {
+				if (!this.audio || !this.timings.length) return;
+				const target = Math.max(0, Math.min(this.timings.length - 1, this.index + delta));
+				const timing = this.timings[target];
+				if (!timing) return;
+				// 跳到别的段时，当前段的时间轴基准会失效——重启所在段的播放。
+				const targetSegment = this.segmentIndexFor(target);
+				if (targetSegment !== this.segmentIndex) {
+					const token = this.playToken;
+					this.segmentIndex = targetSegment;
+					this.segmentBase = 0;
+					for (let i = 0; i < target; i++) {
+						const t = this.timings[i];
+						if (t) this.segmentBase = Math.max(this.segmentBase, t.offset);
+					}
+					this.playSegment(token, targetSegment);
+					return;
+				}
+				this.audio.currentTime = Math.max(0, timing.offset - this.segmentBase);
+				for (let i = 0; i < target; i++) this.mark(i, 'done');
+				this.mark(target, 'active');
+				this.index = target;
+				this.emit();
+			}
+			/** 某个句子属于哪一段。 */
+			segmentIndexFor(sentenceIndex) {
+				let result = 0;
+				for (let i = 0; i < this.segmentFirstIndex.length; i++) {
+					if (this.segmentFirstIndex[i] <= sentenceIndex) result = i;
+				}
+				return result;
+			}
+			stopAudio() {
+				if (this.raf) { cancelAnimationFrame(this.raf); this.raf = null; }
+				// abort 掉所有正在读的流：Chromium 会以 AbortError 拒绝那次 read()，
+				// synthesize() 用自己 controller 的 signal 判定这是主动取消，不会当成故障。
+				for (const controller of Array.from(this.controllers)) {
+					try { controller.abort(); } catch {}
+				}
+				this.controllers.clear();
+				this.synthPromises.clear();
+				this.releaseAudio();
+			}
+			stop() {
+				this.stopAudio();
+				this.clearMarks();
+				this.status = 'idle';
+				this.index = -1;
+				this.total = 0;
+				this.timings = [];
+				this.segments = [];
+				this.segmentFirstIndex = [];
+				this.emit();
+			}
+			dispose() {
+				this.stop();
+				this.listeners.clear();
+			}
+		};
 
 		const JournalIcon = () => h('svg', {
 			viewBox: '0 0 20 20', width: 20, height: 20, 'aria-hidden': true,
@@ -457,7 +1257,7 @@ window.__ModuleLoader__.load({
 
 		const TRANS_KEY = 'journal.reader.translations';
 
-		function SelectionPopup({ popup, t, explainReady, onClose, onChat }) {
+		function SelectionPopup({ popup, t, explainReady, onClose, onChat, onSpeak }) {
 			const [mode, setMode] = useState(null);
 			const [content, setContent] = useState('');
 			const [busy, setBusy] = useState(false);
@@ -558,6 +1358,11 @@ window.__ModuleLoader__.load({
 							disabled: busy && mode !== 'dict', onClick: () => run('dict')
 						}, t('lookup')) : null,
 						h('button', { className: 'jr-mini', onClick: () => run('trans') }, t('translate')),
+					h('button', {
+						className: 'jr-mini',
+						title: t('readAloud'),
+						onClick: () => { stop(); onSpeak(popup.text); }
+					}, t('readAloud')),
 						h('button', {
 							className: 'jr-mini',
 							disabled: !explainReady,
@@ -649,6 +1454,53 @@ window.__ModuleLoader__.load({
 			const chatMsgsRef = useRef(null);
 			const initialMagRef = useRef(magKey);
 
+			// —— 朗读 ——
+			const engineRef = useRef(null);
+			const [speech, setSpeech] = useState(() => ({
+				status: 'idle', index: -1, total: 0, rate: 1, voiceURI: '', voices: [],
+				error: null
+			}));
+			const [speechOpen, setSpeechOpen] = useState(false);
+			// 引擎必须在 effect 里创建：渲染期 new 会让 React 的严格模式挂载两次，
+			// 多余的实例会留下未注销的监听。
+			useEffect(() => {
+				const engine = new CloudSpeechEngine();
+				engineRef.current = engine;
+				const prefs = readJson(SETTINGS_KEY, {});
+				if (typeof prefs.speechRate === 'number') engine.setRate(prefs.speechRate);
+				if (typeof prefs.speechVoice === 'string') engine.setVoice(prefs.speechVoice);
+				const unsubscribe = engine.subscribe((snap) => setSpeech(snap));
+				setSpeech(engine.snapshot());
+				// 云端音色表是异步的，拉回来后控制条的下拉框才有选项。
+				engine.loadVoices().catch(() => {});
+				return () => {
+					unsubscribe();
+					engine.dispose();
+					engineRef.current = null;
+				};
+			}, []);
+			const changeSpeechRate = useCallback((value) => {
+				const engine = engineRef.current;
+				if (!engine) return;
+				engine.setRate(value);
+				const prefs = readJson(SETTINGS_KEY, {});
+				prefs.speechRate = engine.rate;
+				writeJson(SETTINGS_KEY, prefs);
+			}, []);
+			const changeSpeechVoice = useCallback((voiceURI) => {
+				const engine = engineRef.current;
+				if (!engine) return;
+				engine.setVoice(voiceURI);
+				const prefs = readJson(SETTINGS_KEY, {});
+				prefs.speechVoice = voiceURI;
+				writeJson(SETTINGS_KEY, prefs);
+			}, []);
+
+			const stopSpeech = useCallback(() => {
+				const engine = engineRef.current;
+				if (engine) engine.stop();
+			}, []);
+
 			const setModePref = useCallback((next) => {
 				setViewMode(next);
 				const prefs = readJson(SETTINGS_KEY, {});
@@ -721,6 +1573,9 @@ window.__ModuleLoader__.load({
 				if (abortRef.current) abortRef.current.abort();
 				for (const controller of transAbortsRef.current) controller.abort();
 				transAbortsRef.current.clear();
+				// 换章就停朗读：否则上一章的语音会继续在后台念下去。
+				const engine = engineRef.current;
+				if (engine) engine.stop();
 				setTransMap({});
 				const controller = new AbortController();
 				abortRef.current = controller;
@@ -783,6 +1638,57 @@ window.__ModuleLoader__.load({
 					return [{ type: 'raw', html }];
 				}
 			}, [html]);
+
+			/** 朗读当前章节正文；PDF 模式没有可高亮的 DOM，退化为只发声。 */
+			const startSpeech = useCallback((startIndex) => {
+				const engine = engineRef.current;
+				if (!engine) return;
+				const container = contentRef.current;
+				const fromDom = container ? annotateSentences(container) : { sentences: [] };
+				const sentences = fromDom.sentences.length ? fromDom.sentences : sentencesFromBlocks(blocks);
+				if (!sentences.length) return;
+				engine.play(sentences, startIndex || 0);
+			}, [blocks]);
+
+			const toggleSpeech = useCallback(() => {
+				const engine = engineRef.current;
+				if (!engine) return;
+				if (engine.status === 'idle' || engine.status === 'done') {
+					setSpeechOpen(true);
+					startSpeech(0);
+					return;
+				}
+				engine.toggle();
+			}, [startSpeech]);
+
+			const jumpSpeech = useCallback((delta) => {
+				const engine = engineRef.current;
+				if (!engine) return;
+				engine.jump(delta);
+			}, [startSpeech]);
+
+			/** 单独朗读一段（或一段选中的文字）：只发声，不接管全文队列。 */
+			const speakParagraph = useCallback((text) => {
+				const engine = engineRef.current;
+				if (!engine || !text) return;
+				const sentences = splitSentences(text).map((sentence) => ({ text: sentence, el: null, root: null }));
+				if (!sentences.length) return;
+				setSpeechOpen(true);
+				engine.play(sentences, 0);
+			}, []);
+
+			/** 从正文某处开始朗读整章（点击段落上的句子标记）。 */
+			const speakFromSentence = useCallback((sentence) => {
+				const engine = engineRef.current;
+				if (!engine) return;
+				const container = contentRef.current;
+				const fromDom = container ? annotateSentences(container) : { sentences: [] };
+				const sentences = fromDom.sentences.length ? fromDom.sentences : sentencesFromBlocks(blocks);
+				if (!sentences.length) return;
+				const index = Math.max(0, sentences.findIndex((item) => item.el === sentence));
+				setSpeechOpen(true);
+				engine.play(sentences, index < 0 ? 0 : index);
+			}, [blocks]);
 
 			const translateBlock = useCallback((index, text) => {
 				const cache = readJson(TRANS_KEY, {});
@@ -911,6 +1817,14 @@ window.__ModuleLoader__.load({
 			const onArticleClick = (event) => {
 				const target = event.target;
 				if (!target || typeof target.closest !== 'function') return;
+				// 点击句子标记：从这句开始朗读整章。
+				const sentenceEl = target.closest('.jr-sentence');
+				if (sentenceEl && contentRef.current && contentRef.current.contains(sentenceEl)) {
+					event.preventDefault();
+					setPopup(null);
+					speakFromSentence(sentenceEl);
+					return;
+				}
 				const anchor = target.closest('a');
 				if (!anchor || !contentRef.current || !contentRef.current.contains(anchor)) return;
 				const raw = anchor.getAttribute('href') || '';
@@ -999,6 +1913,17 @@ window.__ModuleLoader__.load({
 					h('button', { className: 'jr-btn', onClick: () => setTocOpen(!tocOpen) }, t('toc')),
 					h('button', { className: 'jr-btn', onClick: () => changeFont(-1) }, t('fontSmaller')),
 					h('button', { className: 'jr-btn', onClick: () => changeFont(1) }, t('fontLarger')),
+					h('button', {
+						className: 'jr-btn',
+						'data-active': speechOpen || speech.status === 'playing' || undefined,
+						title: t('readAloud'),
+						onClick: () => {
+							setSpeechOpen(true);
+							const engine = engineRef.current;
+							// 还没开始就立刻开读；已在播放时只展开控制条。
+							if (engine && (engine.status === 'idle' || engine.status === 'done')) startSpeech(0);
+						}
+					}, h(SpeakerIcon, null), ' ', t('readAloud')),
 					h('button', { className: 'jr-btn', 'data-active': chatOpen || undefined, onClick: () => setChatOpen((open) => !open) }, t('chat')),
 					viewMode === 'text' ? h('button', { className: 'jr-btn', 'data-active': dual || undefined, onClick: () => setDual(!dual) }, t('dual')) : null,
 					meta && meta.files && meta.files.pdf ? h('button', {
@@ -1011,6 +1936,15 @@ window.__ModuleLoader__.load({
 						target: '_blank', rel: 'noreferrer'
 					}, t('download')) : null
 				),
+				speechOpen ? h(SpeechBar, {
+					speech, t,
+					onToggle: toggleSpeech,
+					onStop: stopSpeech,
+					onJump: jumpSpeech,
+					onRate: changeSpeechRate,
+					onVoice: changeSpeechVoice,
+					onClose: () => setSpeechOpen(false)
+				}) : null,
 				viewMode === 'pdf' && meta && meta.files && meta.files.pdf ? h('div', { className: 'jr-body' },
 				tocOpen && chapters.length ? h('nav', { className: 'jr-toc' },
 						chapters.map((chapter) => {
@@ -1072,7 +2006,13 @@ window.__ModuleLoader__.load({
 										className: 'jr-para-btn',
 										title: t('translate'),
 										onClick: (event) => { event.stopPropagation(); toggleTranslate(index, block.text); }
-									}, transMap[index] && transMap[index].state === 'done' ? '—' : '译') : null
+									}, transMap[index] && transMap[index].state === 'done' ? '—' : '译') : null,
+									block.text && block.text.length >= 2 ? h('button', {
+										className: 'jr-para-btn',
+										'data-role': 'speak',
+										title: t('readAloud'),
+										onClick: (event) => { event.stopPropagation(); speakParagraph(block.text); }
+									}, '♪') : null
 								)
 								: h('div', { key: index, dangerouslySetInnerHTML: { __html: block.html } })) : null,
 							!chapterLoading && !chapterError && !blocks.length && html !== null ? h('div', { className: 'jr-empty' }, t('noChapters')) : null
@@ -1095,7 +2035,8 @@ window.__ModuleLoader__.load({
 					key: `${popup.text}@${Math.round(popup.rect.top)}`,
 					popup, t, explainReady,
 					onClose: () => setPopup(null),
-					onChat: (text, isWord) => { setPopup(null); openChatWithText(text, isWord); }
+					onChat: (text, isWord) => { setPopup(null); openChatWithText(text, isWord); },
+					onSpeak: (text) => { setPopup(null); speakParagraph(text); }
 				}) : null
 			);
 		}
@@ -1132,6 +2073,64 @@ window.__ModuleLoader__.load({
 		const SAVED_KEY = 'journal.reader.saved';
 		const SESSION_KEY = 'journal.reader.session';
 		const CHATS_KEY = 'journal.reader.chats';
+
+		function SpeechBar({ speech, t, onToggle, onStop, onJump, onRate, onVoice, onClose }) {
+			const playing = speech.status === 'playing';
+			const paused = speech.status === 'paused';
+			const loading = speech.status === 'loading';
+			const voices = speech.voices || [];
+			return h('div', { className: 'jr-speak-bar' },
+				h('button', {
+					className: 'jr-speak-icon',
+					title: playing ? t('speechPause') : t('speechPlay'),
+					disabled: loading,
+					onClick: onToggle
+				}, playing ? '❚❚' : '▶'),
+				h('button', {
+					className: 'jr-speak-icon',
+					title: t('speechStop'),
+					disabled: speech.status === 'idle',
+					onClick: onStop
+				}, '■'),
+				h('button', {
+					className: 'jr-speak-icon',
+					title: t('speechPrev'),
+					disabled: !speech.total,
+					onClick: () => onJump(-1)
+				}, '⏮'),
+				h('button', {
+					className: 'jr-speak-icon',
+					title: t('speechNext'),
+					disabled: !speech.total,
+					onClick: () => onJump(1)
+				}, '⏭'),
+				h('label', { className: 'jr-speak-rate', title: t('speechRate') },
+					t('speechRate'),
+					h('input', {
+						type: 'range', min: '0.5', max: '2', step: '0.1',
+						value: String(speech.rate),
+						onChange: (event) => onRate(Number(event.target.value))
+					}),
+					h('span', { className: 'jr-speak-progress' }, `${speech.rate.toFixed(1)}×`)
+				),
+				h('select', {
+					className: 'jr-speak-select',
+					value: speech.voiceURI,
+					title: t('speechVoice'),
+					onChange: (event) => onVoice(event.target.value)
+				},
+					h('option', { value: '' }, t('speechAuto')),
+					voices.map((voice) => h('option', { key: voice.id, value: voice.id },
+						`${voice.name.replace(/^en-US-/, '').replace(/Neural$/, '')}${voice.gender === 'Male' ? ' ♂' : voice.gender === 'Female' ? ' ♀' : ''}`))
+				),
+				loading ? h('span', { className: 'jr-speak-progress' }, t('speechLoading')) : null,
+				speech.total ? h('span', { className: 'jr-speak-progress' },
+					`${Math.max(0, speech.index + 1)} / ${speech.total}`) : null,
+				speech.error ? h('span', { className: 'jr-speak-status', style: { color: 'var(--dsw-alias-state-error-primary)' } },
+					speech.error) : null,
+				h('button', { className: 'jr-speak-icon', title: t('close'), onClick: onClose }, '×')
+			);
+		}
 
 		function JournalPage({ t }) {
 			const [shelf, setShelf] = useState({ loading: true, error: null, data: null });

@@ -6,6 +6,8 @@
  *  - GET /jr/api/issue?path=<issue dir>        one issue's chapter list (downloads + parses the epub)
  *  - GET /jr/api/chapter?path=<...>&index=N    one chapter's sanitized HTML
  *  - GET /jr/api/explain?text=<...>&mode=...   AI explanation streamed as plain text over ctx.llm
+ *  - GET /jr/api/voices                       Edge TTS voice catalogue (neural voices)
+ *  - POST /jr/api/speech                      Edge TTS synthesis; streams mp3 + sentence timings
  */
 import fs from 'node:fs/promises';
 import fsSync from 'node:fs';
@@ -226,6 +228,18 @@ async function ghToken() {
 	return ghTokenCache.token;
 }
 
+/**
+ * 403 的说明要区分两种情况：带 token 却被限流（5000/小时也用完了），
+ * 和根本没带 token（未认证的 60 次/小时，很容易撞上）。
+ */
+function rateLimitMessage(token) {
+	if (token) {
+		return 'GitHub API rate limit reached (authenticated 5000 requests/hour); try again later';
+	}
+	return 'GitHub API rate limit reached (unauthenticated 60 requests/hour). '
+		+ 'Sign in with the GitHub CLI (gh auth login) so the plugin can use a higher limit.';
+}
+
 async function fetchIssueTree(signal) {
 	const api = `https://api.github.com/repos/${REPO.owner}/${REPO.repo}/git/trees/${REPO.branch}?recursive=1`;
 	const state = readState();
@@ -245,7 +259,7 @@ async function fetchIssueTree(signal) {
 			mergeState('tree', { at: Date.now(), etag: res.headers.get('etag') || null, data });
 			return data;
 		}
-		if (res.status === 403) throw new Error('GitHub API rate limit reached (unauthenticated 60 requests/hour); try again later');
+		if (res.status === 403) throw new Error(rateLimitMessage(token));
 		if (GH_RETRY_STATUS.has(res.status) && attempt < 2) {
 			await new Promise((resolve, reject) => {
 				const timer = setTimeout(resolve, 1200 * (attempt + 1));
@@ -283,6 +297,10 @@ async function ghContents(query, signal) {
 		accept: 'application/vnd.github+json',
 		'user-agent': 'dsh-journal-reader-plugin (+https://github.com/hehonghui/awesome-english-ebooks)'
 	};
+	// 同样要带 token：contents API 与 trees API 各有各的限额，
+	// 漏掉认证就会撞上未认证的 60 次/小时。
+	const token = await ghToken();
+	if (token) headers.authorization = `Bearer ${token}`;
 	if (cached && cached.etag) headers['if-none-match'] = cached.etag;
 	for (let attempt = 0; ; attempt++) {
 		const res = await fetch(api, { signal, headers });
@@ -292,7 +310,7 @@ async function ghContents(query, signal) {
 			return { data, etag };
 		}
 		if (res.status === 304 && cached) return { data: cached.data, etag: cached.etag };
-		if (res.status === 403) throw new Error('GitHub API rate limit reached (unauthenticated 60 requests/hour); try again later');
+		if (res.status === 403) throw new Error(rateLimitMessage(token));
 		if (GH_RETRY_STATUS.has(res.status) && attempt < 2) {
 			await new Promise((resolve, reject) => {
 				const timer = setTimeout(resolve, 1200 * (attempt + 1));
@@ -1014,6 +1032,207 @@ async function handleAsk(ctx, req, res) {
 	}
 }
 
+// —— Edge TTS（微软云端神经语音）——
+// 一个常驻的 Python 子进程跑 speech.py，逐行收发 JSON 帧。这样每句合成的
+// 开销只是一次 stdin 写入，不用反复付 Python 的启动时间。
+// 进程不可用时返回 null，客户端会退回浏览器的 Web Speech API。
+const speechState = {
+	child: null,
+	stdin: null,
+	pending: new Map(),
+	buffer: '',
+	seq: 0,
+	failed: false,
+	scriptStamp: 0,     // speech.py 的 mtime，用来发现脚本改动并重启常驻进程
+};
+
+function pythonCandidates() {
+	const list = [];
+	// DSH 自带的运行时（安装目录与用户目录各有一份）。
+	const home = process.env.DSH_HOME || path.join(os.homedir(), '.dsh');
+	const installRoot = path.dirname(new URL(import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, '$1'));
+	list.push(path.join(home, 'dsh-runtimes', 'dsh-primary-runtime', 'dependencies', 'python', 'python.exe'));
+	list.push(path.join(installRoot, 'runtime', 'primary-runtime', 'dependencies', 'python', 'python.exe'));
+	// PATH 上的 python。
+	list.push('python');
+	list.push('python3');
+	return list;
+}
+
+function resolvePython() {
+	for (const candidate of pythonCandidates()) {
+		if (!candidate.includes(path.sep)) return candidate;
+		try { if (existsSync(candidate)) return candidate; } catch {}
+	}
+	return null;
+}
+
+function speechScriptPath() {
+	const dir = path.dirname(new URL(import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, '$1'));
+	return path.join(dir, 'speech.py');
+}
+
+function emitFrame(frame) {
+	const child = speechState.child;
+	if (!child || !child.stdin || child.stdin.destroyed) return;
+	try {
+		child.stdin.write(JSON.stringify(frame) + '\n');
+	} catch {}
+}
+
+function handleSpeechFrame(line) {
+	let frame;
+	try { frame = JSON.parse(line); } catch { return; }
+	// speech.py 给每个响应带上请求 id：客户端会并发合成（当前段 + 预取下一段），
+	// 没有 id 就无法把响应分发给正确的请求。
+	const key = frame.id;
+	const entry = key ? speechState.pending.get(key) : null;
+	if (!entry) return;
+	if (frame.type === 'error') {
+		speechState.pending.delete(key);
+		entry.reject(new Error(frame.message || 'edge tts error'));
+		return;
+	}
+	if (frame.type === 'voices') {
+		speechState.pending.delete(key);
+		entry.resolve(frame.voices || []);
+		return;
+	}
+	entry.onFrame?.(frame);
+	if (frame.type === 'done') {
+		speechState.pending.delete(key);
+		entry.resolve?.();
+	}
+}
+
+async function ensureSpeechProcess(ctx) {
+	if (speechState.failed) return null;
+	const script = speechScriptPath();
+	// 常驻的 Python 进程会把启动时的脚本读进内存：改了 speech.py 之后，
+	// 老进程仍在跑旧代码。这里比对 mtime，发现变化就换掉它。
+	if (speechState.child && !speechState.child.killed) {
+		let stamp = 0;
+		try { stamp = fsSync.statSync(script).mtimeMs; } catch {}
+		if (stamp && speechState.scriptStamp && stamp !== speechState.scriptStamp) {
+			try { speechState.child.kill(); } catch {}
+			speechState.child = null;
+		} else {
+			return speechState.child;
+		}
+	}
+	const python = resolvePython();
+	if (!python || !existsSync(script)) { speechState.failed = true; return null; }
+	let stamp = 0;
+	try { stamp = fsSync.statSync(script).mtimeMs; } catch {}
+	const { spawn } = await import('node:child_process');
+	let child;
+	try {
+		child = spawn(python, [script], { windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'] });
+	} catch {
+		speechState.failed = true;
+		return null;
+	}
+	speechState.child = child;
+	speechState.scriptStamp = stamp;
+	speechState.buffer = '';
+	child.stdout.setEncoding('utf8');
+	child.stdout.on('data', (chunk) => {
+		speechState.buffer += chunk;
+		let index;
+		while ((index = speechState.buffer.indexOf('\n')) >= 0) {
+			const line = speechState.buffer.slice(0, index).trim();
+			speechState.buffer = speechState.buffer.slice(index + 1);
+			if (line) handleSpeechFrame(line);
+		}
+	});
+	child.on('error', () => { speechState.failed = true; speechState.child = null; });
+	child.on('exit', () => {
+		speechState.child = null;
+		for (const entry of speechState.pending.values()) {
+			try { entry.reject(new Error('edge tts process exited')); } catch {}
+		}
+		speechState.pending.clear();
+	});
+	// 若 python 能启动但缺少 edge_tts，首个请求会收到 error 帧。
+	return child;
+}
+
+async function requestSpeechFrame(request, onFrame, timeoutMs = 120000) {
+	const child = await ensureSpeechProcess();
+	if (!child) throw new Error('edge tts unavailable');
+	return new Promise((resolve, reject) => {
+		// 每个请求一个独立的 id 与键：客户端会并发合成（当前段 + 预取下一段），
+		// 固定键会让后一个请求覆盖前一个的 pending，导致音频张冠李戴。
+		const id = `r${++speechState.seq}`;
+		const key = id;
+		const timer = setTimeout(() => {
+			speechState.pending.delete(key);
+			reject(new Error('edge tts timeout'));
+		}, timeoutMs);
+		speechState.pending.set(key, {
+			onFrame,
+			resolve: (value) => { clearTimeout(timer); speechState.pending.delete(key); resolve(value); },
+			reject: (error) => { clearTimeout(timer); speechState.pending.delete(key); reject(error); }
+		});
+		emitFrame({ ...request, id });
+	});
+}
+
+async function handleVoices(ctx, res) {
+	try {
+		const voices = await requestSpeechFrame({ op: 'voices' }, null, 20000);
+		sendJson(res, 200, { voices });
+	} catch (error) {
+		fail(res, error.message || error, 503);
+	}
+}
+
+async function handleSpeech(ctx, req, res) {
+	let body;
+	try {
+		body = JSON.parse(await readBody(req, 200000));
+	} catch {
+		return fail(res, 'invalid JSON body', 400);
+	}
+	const text = typeof body.text === 'string' ? body.text.trim() : '';
+	if (!text) return fail(res, 'empty text', 400);
+	if (text.length > 20000) return fail(res, 'text too long (max 20000 chars)', 400);
+	// 孤立代理项（半个 emoji）会让 Python 的 UTF-8 编码直接失败。
+	// 这里把落单的代理项替换掉，宁可少一个符号，也不要整段合成失败。
+	const safeText = text.replace(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/g, ' ');
+	const voice = typeof body.voice === 'string' && /^[A-Za-z0-9-]+$/.test(body.voice) ? body.voice : 'en-US-AvaNeural';
+	const rate = Number.isFinite(Number(body.rate)) ? Math.min(2, Math.max(0.5, Number(body.rate))) : 1;
+	const volume = Number.isFinite(Number(body.volume)) ? Math.min(1, Math.max(0.1, Number(body.volume))) : 1;
+
+	res.statusCode = 200;
+	res.setHeader('content-type', 'application/x-ndjson; charset=utf-8');
+	res.setHeader('cache-control', 'no-store');
+
+	// 响应是一串 JSON 行（与 speech.py 的帧协议一致），音频以 base64 承载。
+	// 统一成一种帧格式，客户端就不必在二进制里猜哪里是 mp3、哪里是时间戳。
+	const send = (frame) => {
+		if (!res.writableEnded) res.write(JSON.stringify(frame) + '\n');
+	};
+	send({ type: 'header', voice, rate });
+	try {
+		await requestSpeechFrame({ op: 'synthesize', text: safeText, voice, rate, volume }, (frame) => {
+			if (frame.type === 'audio') send({ type: 'audio', data: frame.data });
+			else if (frame.type === 'boundary') {
+				send({
+					type: 'boundary',
+					offset: frame.offset,
+					duration: frame.duration,
+					text: frame.text
+				});
+			}
+		});
+	} catch (error) {
+		send({ type: 'error', message: String(error.message || error) });
+	}
+	send({ type: 'done' });
+	res.end();
+}
+
 async function handle(ctx, req, res) {
 	const url = new URL(String(req.url), 'http://localhost');
 	const route = url.pathname.replace(/^\/jr\/api/, '') || '/';
@@ -1037,6 +1256,17 @@ async function handle(ctx, req, res) {
 			return await handleAsk(ctx, req, res);
 		}
 		if (route === '/state') return await handleState(ctx, req, res);
+		// /speech 是 POST 路由，必须排在下面那个「只允许 GET」的通用守卫之前，
+		// 否则 POST 会在到达它之前就被 405 拦下。
+		if (route === '/speech') {
+			if (req.method !== 'POST') {
+				res.statusCode = 405;
+				res.setHeader('allow', 'POST');
+				res.end();
+				return;
+			}
+			return await handleSpeech(ctx, req, res);
+		}
 		if (req.method !== 'GET' && req.method !== 'HEAD') {
 			res.statusCode = 405;
 			res.setHeader('allow', 'GET');
@@ -1050,6 +1280,7 @@ async function handle(ctx, req, res) {
 		if (route === '/pdf') return await handlePdf(ctx, url, res);
 		if (route === '/asset') return await handleAsset(ctx, url, res);
 		if (route === '/explain') return await handleExplain(ctx, url, res, req);
+		if (route === '/voices') return await handleVoices(ctx, res);
 		fail(res, 'not found', 404);
 	} catch (error) {
 		if (!res.headersSent) fail(res, error.message || error, 500);
