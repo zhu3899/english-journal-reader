@@ -1668,23 +1668,52 @@ window.__ModuleLoader__.load({
 				};
 			}, []);
 
+			/**
+			 * 把章节 HTML 拆成渲染块。
+			 *
+			 * 段落按钮（译 / ♪）只挂在 type='para' 的块上，所以得尽量多认出段落。
+			 * 各刊的正文层级不一样：
+			 *   经济学人  <body><p>…</p>…            ← 段落是 body 直子
+			 *   纽约客    <body><a/><p>…</p><div/>     ← 混排
+			 *   大西洋/连线 <body><div><p>…</p></div>  ← 段落包在 div 里
+			 * 只扫 body 的直接子节点会漏掉后三本的全部段落，
+			 * 所以这里递归下钻：遇到 div/section/article 等容器就进去找段落，
+			 * 容器本身不再单独成块（否则同一段文字会被渲染两遍）。
+			 */
 			const blocks = useMemo(() => {
 				if (!html) return [];
 				try {
 					const doc = new DOMParser().parseFromString(html, 'text/html');
 					const out = [];
-					for (const node of Array.from(doc.body.childNodes)) {
-						if (node.nodeType === 1 && (node.tagName === 'P' || node.tagName === 'BLOCKQUOTE')) {
-							const text = (node.textContent || '').replace(/\s+/g, ' ').trim();
-							const hasImg = typeof node.querySelector === 'function' && Boolean(node.querySelector('img'));
-							if (text.length < 2 && !hasImg) continue;
-							out.push({ type: 'para', html: node.outerHTML, text });
-						} else if (node.nodeType === 1) {
-							out.push({ type: 'raw', html: node.outerHTML });
-						} else if (node.nodeType === 3 && node.textContent.trim()) {
-							out.push({ type: 'raw', html: node.textContent });
+					// 只下钻这些容器：它们在 epub 里纯粹是排版用的壳。
+					const CONTAINERS = new Set(['DIV', 'SECTION', 'ARTICLE', 'MAIN', 'ASIDE']);
+					const visit = (nodes) => {
+						for (const node of Array.from(nodes)) {
+							if (node.nodeType === 1 && (node.tagName === 'P' || node.tagName === 'BLOCKQUOTE')) {
+								const text = (node.textContent || '').replace(/\s+/g, ' ').trim();
+								const hasImg = typeof node.querySelector === 'function' && Boolean(node.querySelector('img'));
+								if (text.length < 2 && !hasImg) continue;
+								out.push({ type: 'para', html: node.outerHTML, text });
+							} else if (node.nodeType === 1 && CONTAINERS.has(node.tagName)) {
+								// 容器里如果能找到段落，就用段落代替容器；
+								// 只有图或纯装饰时才保留容器本身。
+								const before = out.length;
+								visit(node.childNodes);
+								if (out.length === before) {
+									const text = (node.textContent || '').replace(/\s+/g, ' ').trim();
+									const hasImg = typeof node.querySelector === 'function' && Boolean(node.querySelector('img'));
+									if (text.length >= 2 || hasImg) {
+										out.push({ type: 'raw', html: node.outerHTML });
+									}
+								}
+							} else if (node.nodeType === 1) {
+								out.push({ type: 'raw', html: node.outerHTML });
+							} else if (node.nodeType === 3 && node.textContent.trim()) {
+								out.push({ type: 'raw', html: node.textContent });
+							}
 						}
-					}
+					};
+					visit(doc.body.childNodes);
 					return out;
 				} catch {
 					return [{ type: 'raw', html }];
