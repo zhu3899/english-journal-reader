@@ -19,7 +19,6 @@ window.__ModuleLoader__.load({
 		const zh = {
 			panel: '外刊精读台',
 			title: '外刊精读台',
-			subtitle: '英文外刊 · 数据来自 awesome-english-ebooks',
 			refresh: '刷新',
 			loading: '加载中…',
 			retry: '重试',
@@ -83,7 +82,6 @@ window.__ModuleLoader__.load({
 		const en = {
 			panel: 'Journal Reader',
 			title: 'Journal Reader',
-			subtitle: 'English magazines · data from awesome-english-ebooks',
 			refresh: 'Refresh',
 			loading: 'Loading…',
 			retry: 'Retry',
@@ -149,8 +147,7 @@ window.__ModuleLoader__.load({
 			'.jr-page{height:100%;overflow:auto;background:var(--dsw-alias-bg-base);color:var(--dsw-alias-label-primary)}',
 			'.jr-shell{max-width:960px;margin:0 auto;padding:28px 24px 48px}',
 			'.jr-title{font-size:22px;font-weight:650;letter-spacing:.2px}',
-			'.jr-sub{margin-top:4px;font-size:13px;color:var(--dsw-alias-label-secondary)}',
-			'.jr-head{display:flex;align-items:flex-start;justify-content:space-between;gap:12px;margin-bottom:20px}',
+			'.jr-head{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:20px}',
 			'.jr-btn{appearance:none;border:1px solid var(--dsw-alias-border-l2);background:var(--dsw-alias-bg-layer-1);color:var(--dsw-alias-label-primary);border-radius:8px;padding:6px 12px;font-size:13px;cursor:pointer;display:inline-flex;align-items:center;gap:6px}',
 			'.jr-btn:hover{background:var(--dsw-alias-bg-layer-2)}',
 			'.jr-btn:disabled{opacity:.5;cursor:default}',
@@ -1274,8 +1271,7 @@ window.__ModuleLoader__.load({
 			return h('div', { className: 'jr-shell' },
 				h('div', { className: 'jr-head' },
 					h('div', null,
-						h('div', { className: 'jr-title' }, t('title')),
-						h('div', { className: 'jr-sub' }, t('subtitle'))
+						h('div', { className: 'jr-title' }, t('title'))
 					),
 					h('button', { className: 'jr-btn', onClick: onRefresh }, t('refresh'))
 				),
