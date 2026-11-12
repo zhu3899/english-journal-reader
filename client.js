@@ -53,6 +53,7 @@ window.__ModuleLoader__.load({
 			noChapters: '这一期暂无可读章节',
 			issuesCount: '{n} 期可读',
 			noIssues: '暂无可读期号',
+			loadMore: '再加载 {n} 期',
 			saved: '已存',
 			saveFailed: '本地保存失败',
 			chat: 'AI 问答',
@@ -116,6 +117,7 @@ window.__ModuleLoader__.load({
 			noChapters: 'No readable chapters in this issue',
 			issuesCount: '{n} issues',
 			noIssues: 'No readable issues yet',
+			loadMore: 'Load {n} more issues',
 			saved: 'Saved',
 			saveFailed: 'Local save failed',
 			chat: 'AI chat',
@@ -191,6 +193,9 @@ window.__ModuleLoader__.load({
 			'.jr-month:hover{background:var(--dsw-alias-bg-layer-2)}',
 			'.jr-month-chevron{color:var(--dsw-alias-label-secondary);font-size:11px;width:10px;flex:none}',
 			'.jr-month-count{margin-left:auto;color:var(--dsw-alias-label-secondary);font-weight:400;font-size:12px;opacity:.7}',
+			'.jr-submonth{padding:4px 8px 2px;color:var(--dsw-alias-label-secondary);font-size:11px;letter-spacing:.2px}',
+			'.jr-more{display:block;width:100%;margin-top:8px;padding:7px;border:1px dashed var(--dsw-alias-border-l2);border-radius:8px;background:none;color:var(--dsw-alias-label-secondary);font:inherit;font-size:12px;cursor:pointer}',
+			'.jr-more:hover{background:var(--dsw-alias-bg-layer-2);color:var(--dsw-alias-label-primary)}',
 			'.jr-error{margin-top:10px;padding:10px 12px;border-radius:8px;background:var(--dsw-alias-bg-layer-2);color:var(--dsw-alias-state-error-primary);font-size:13px}',
 			'.jr-spin{width:16px;height:16px;border:2px solid var(--dsw-alias-border-l2);border-top-color:var(--dsw-alias-brand-primary);border-radius:50%;animation:jr-rotate .8s linear infinite;display:inline-block;flex:none}',
 			'@keyframes jr-rotate{to{transform:rotate(360deg)}}',
@@ -1166,16 +1171,19 @@ window.__ModuleLoader__.load({
 			);
 		}
 
-		/** 展开后的期号列表：按年/月分组，最新一期置顶高亮。 */
+		/**
+		 * 展开后的期号列表。
+		 *
+		 * 一次不铺开全部日期——经济学人有 97 期，全铺出来是一堵墙。
+		 * 按「页」分：每页 PAGE_SIZE 期，底部「加载更多」继续往下翻。
+		 * 页内仍按月份分组，最新一期带「最新」徽标。
+		 */
 		function IssueList({ mag, issues, t, onOpen, savedSet }) {
+			const PAGE_SIZE = 12;
+			const [page, setPage] = useState(1);
+			const shown = issues.slice(0, page * PAGE_SIZE);
 			const byMonth = mag.cadence !== 'monthly';
-			const groups = [];
-			for (const issue of issues) {
-				const key = byMonth ? issue.date.slice(0, 7) : issue.date.slice(0, 4);
-				const last = groups[groups.length - 1];
-				if (last && last.month === key) last.items.push(issue);
-				else groups.push({ month: key, items: [issue] });
-			}
+
 			const issueRow = (issue, isLatest) => h('div', {
 				key: issue.logicalPath || issue.path,
 				style: { display: 'flex', alignItems: 'center' }
@@ -1194,14 +1202,28 @@ window.__ModuleLoader__.load({
 					target: '_blank', rel: 'noreferrer'
 				}, t('onGithub'))
 			);
+
+			// 页内按月分组；周刊每月一期，杂志每月多期。
+			const months = [];
+			for (const issue of shown) {
+				const key = byMonth ? issue.date.slice(0, 7) : issue.date.slice(0, 4);
+				const last = months[months.length - 1];
+				if (last && last.month === key) last.items.push(issue);
+				else months.push({ month: key, items: [issue] });
+			}
+
+			const remaining = issues.length - shown.length;
 			return h('div', { className: 'jr-issues' },
-				groups.map((group) => h('div', { key: group.month },
-					h('div', { className: 'jr-month', style: { cursor: 'default' } },
-						h('span', null, group.month),
-						h('span', { className: 'jr-month-count' }, String(group.items.length))
-					),
-					group.items.map((issue, index) => issueRow(issue, index === 0 && group.month === groups[0].month))
-				))
+				months.map((group, gi) => h('div', { key: group.month },
+					h('div', { className: 'jr-submonth' }, group.month),
+					group.items.map((issue, index) => issueRow(issue, gi === 0 && index === 0))
+				)),
+				remaining > 0
+					? h('button', {
+						className: 'jr-more',
+						onClick: () => setPage((p) => p + 1)
+					}, t('loadMore').replace('{n}', String(remaining)))
+					: null
 			);
 		}
 
