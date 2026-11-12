@@ -525,7 +525,7 @@ async function handleIssues(ctx, url, res) {
 		const magazines = results.flat();
 		const llm = ctx.get('llm');
 		sendJson(res, 200, {
-			magazines,
+			magazines: magazines.map(summarizeMagazine),
 			explainReady: Boolean(llm && typeof llm.stream === 'function'),
 			repoHtml: `https://github.com/${SOURCES[0].owner}/${SOURCES[0].repo}`
 		});
@@ -540,12 +540,62 @@ async function handleIssues(ctx, url, res) {
 		if (magazines.length) {
 			const llm = ctx.get('llm');
 			sendJson(res, 200, {
-				magazines,
+				magazines: magazines.map(summarizeMagazine),
 				explainReady: Boolean(llm && typeof llm.stream === 'function'),
 				repoHtml: `https://github.com/${SOURCES[0].owner}/${SOURCES[0].repo}`,
 				stale: true
 			});
 			return;
+		}
+		fail(res, error.message || error, 502);
+	}
+}
+
+/**
+ * 期刊架只回摘要：刊物信息 + 最新一期 + 期数。
+ * 完整期号列表由 /jr/api/issues?mag=<key> 按需拉取——期刊架一次要把
+ * 六个源、190 期全部传过来，首屏白屏近 1.5 秒。
+ */
+function summarizeMagazine(mag) {
+	return {
+		key: mag.key,
+		title: mag.title,
+		zh: mag.zh,
+		cadence: mag.cadence,
+		color: mag.color,
+		repo: mag.repo,
+		count: mag.issues.length,
+		latest: mag.latest || null,
+		error: mag.error || null
+	};
+}
+
+/** 某一刊的完整期号列表（展开时才请求）。 */
+async function handleMagIssues(ctx, url, res) {
+	const key = url.searchParams.get('mag');
+	const mag = MAGAZINES.find((m) => m.key === key);
+	if (!mag) return fail(res, 'unknown magazine', 404);
+	const source = sourceById(mag.source);
+	try {
+		const treeData = await fetchIssueTree(undefined, source);
+		const found = issuesFromTree(treeData, source).find((m) => m.key === key);
+		if (!found) return fail(res, 'magazine not found in tree', 404);
+		sendJson(res, 200, {
+			key,
+			issues: found.issues,
+			latest: found.latest || null
+		});
+	} catch (error) {
+		// 网络不通时退回已缓存的 tree。
+		const entry = (readState().trees || {})[source.id];
+		if (entry && entry.data) {
+			try {
+				const found = issuesFromTree(entry.data, source).find((m) => m.key === key);
+				if (found) {
+					sendJson(res, 200, { key, issues: found.issues, latest: found.latest || null, stale: true });
+					return;
+				}
+			} catch {}
 		}
 		fail(res, error.message || error, 502);
 	}
@@ -1521,6 +1571,7 @@ async function handle(ctx, req, res) {
 			return;
 		}
 		if (route === '/issues') return await handleIssues(ctx, url, res);
+		if (route === '/mag-issues') return await handleMagIssues(ctx, url, res);
 		if (route === '/issue') return await handleIssue(ctx, url, res);
 		if (route === '/chapter') return await handleChapter(ctx, url, res);
 		if (route === '/read') return await handleRead(ctx, url, res);

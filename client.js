@@ -52,6 +52,7 @@ window.__ModuleLoader__.load({
 			chapterFallback: '第 {n} 节',
 			noChapters: '这一期暂无可读章节',
 			issuesCount: '{n} 期可读',
+			noIssues: '暂无可读期号',
 			saved: '已存',
 			saveFailed: '本地保存失败',
 			chat: 'AI 问答',
@@ -114,6 +115,7 @@ window.__ModuleLoader__.load({
 			chapterFallback: 'Section {n}',
 			noChapters: 'No readable chapters in this issue',
 			issuesCount: '{n} issues',
+			noIssues: 'No readable issues yet',
 			saved: 'Saved',
 			saveFailed: 'Local save failed',
 			chat: 'AI chat',
@@ -150,16 +152,29 @@ window.__ModuleLoader__.load({
 			'.jr-btn{appearance:none;border:1px solid var(--dsw-alias-border-l2);background:var(--dsw-alias-bg-layer-1);color:var(--dsw-alias-label-primary);border-radius:8px;padding:6px 12px;font-size:13px;cursor:pointer;display:inline-flex;align-items:center;gap:6px}',
 			'.jr-btn:hover{background:var(--dsw-alias-bg-layer-2)}',
 			'.jr-btn:disabled{opacity:.5;cursor:default}',
-			'.jr-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(400px,1fr));gap:16px;align-items:stretch}',
-			'.jr-mag{background:var(--dsw-alias-bg-layer-1);border:1px solid var(--dsw-alias-border-l1);border-radius:12px;padding:14px 16px;display:flex;flex-direction:column;min-height:0}',
-			'.jr-mag-head{display:flex;align-items:center;gap:10px;flex:none}',
+			'.jr-grid{display:flex;flex-direction:column;gap:8px}',
+			// 一行一刊：刊物信息在左，最新期在中间，展开按钮在右。
+			// 展开后的期号列表是文档流里的内容，不做内部滚动——避免嵌套滚动条。
+			'.jr-mag{background:var(--dsw-alias-bg-layer-1);border:1px solid var(--dsw-alias-border-l1);border-radius:10px;overflow:hidden}',
+			'.jr-mag[data-open="true"]{border-color:var(--dsw-alias-border-l2)}',
+			'.jr-mag-row{display:flex;align-items:center;gap:12px;width:100%;padding:12px 14px;border:0;background:none;color:inherit;font:inherit;text-align:left;cursor:pointer}',
+			'.jr-mag-row:hover{background:var(--dsw-alias-bg-layer-2)}',
 			'.jr-chip{width:34px;height:34px;border-radius:8px;color:#fff;font-weight:700;font-size:16px;display:flex;align-items:center;justify-content:center;flex:none}',
+			'.jr-mag-info{min-width:0;flex:1}',
 			'.jr-mag-name{font-size:15px;font-weight:600}',
 			'.jr-mag-meta{font-size:12px;color:var(--dsw-alias-label-secondary);margin-top:1px}',
-			'.jr-issues{margin-top:10px;border-top:1px solid var(--dsw-alias-border-l1);flex:1;min-height:0;overflow-y:auto;max-height:460px;scrollbar-width:thin;scrollbar-gutter:stable}',
-			'.jr-issue{display:flex;align-items:center;justify-content:space-between;width:100%;padding:7px 8px;border:0;background:none;color:inherit;font:inherit;font-size:13px;border-radius:8px;cursor:pointer;text-align:left}',
+			// 最新一期：直接可点开，不用先展开。
+			'.jr-mag-latest{display:flex;align-items:center;gap:8px;flex:none;margin-left:auto}',
+			'.jr-latest-date{font-size:13px;font-variant-numeric:tabular-nums;color:var(--dsw-alias-label-primary)}',
+			'.jr-latest-tag{font-size:11px;color:var(--dsw-alias-brand-primary);border:1px solid currentColor;border-radius:99px;padding:0 7px;line-height:16px}',
+			'.jr-toggle{flex:none;width:22px;height:22px;border:0;background:none;color:var(--dsw-alias-label-secondary);cursor:pointer;font-size:11px;display:flex;align-items:center;justify-content:center;border-radius:6px}',
+			'.jr-toggle:hover{background:var(--dsw-alias-bg-layer-1);color:var(--dsw-alias-label-primary)}',
+			'.jr-toggle[data-open="true"]{transform:rotate(90deg)}',
+			// 展开区：跟在行下面，用文档流排布，没有内部滚动条。
+			'.jr-issues{border-top:1px solid var(--dsw-alias-border-l1);padding:6px 14px 10px}',
+			'.jr-issue{display:flex;align-items:center;justify-content:space-between;width:100%;padding:6px 8px;border:0;background:none;color:inherit;font:inherit;font-size:13px;border-radius:8px;cursor:pointer;text-align:left}',
 			'.jr-issue:hover{background:var(--dsw-alias-bg-layer-2)}',
-			'.jr-issue-date{font-variant-numeric:tabular-nums}',
+			'.jr-issue-date{font-variant-numeric:tabular-nums;display:inline-flex;align-items:center;gap:8px}',
 			'.jr-issue-latest{font-size:11px;color:var(--dsw-alias-brand-primary);border:1px solid currentColor;border-radius:99px;padding:0 7px;line-height:16px;margin-left:8px}',
 			'.jr-issue-saved{font-size:11px;color:var(--dsw-alias-state-success-primary);border:1px solid currentColor;border-radius:99px;padding:0 7px;line-height:16px;margin-left:8px}',
 			'.jr-para{position:relative}',
@@ -172,10 +187,10 @@ window.__ModuleLoader__.load({
 			'.jr-link{color:var(--dsw-alias-label-secondary);font-size:12px;text-decoration:none}',
 			'.jr-link:hover{color:var(--dsw-alias-label-primary);text-decoration:underline}',
 			'.jr-empty{padding:14px 8px;font-size:13px;color:var(--dsw-alias-label-secondary)}',
-			'.jr-month{display:flex;align-items:center;gap:8px;width:100%;text-align:left;border:0;background:none;color:var(--dsw-alias-label-primary);font:inherit;font-size:13px;font-weight:600;padding:7px 8px;border-radius:8px;cursor:pointer}',
+			'.jr-month{display:flex;align-items:center;gap:8px;width:100%;text-align:left;border:0;background:none;color:var(--dsw-alias-label-primary);font:inherit;font-size:12px;font-weight:600;padding:9px 8px 4px;cursor:pointer;letter-spacing:.2px}',
 			'.jr-month:hover{background:var(--dsw-alias-bg-layer-2)}',
 			'.jr-month-chevron{color:var(--dsw-alias-label-secondary);font-size:11px;width:10px;flex:none}',
-			'.jr-month-count{margin-left:auto;color:var(--dsw-alias-label-secondary);font-weight:400;font-size:12px}',
+			'.jr-month-count{margin-left:auto;color:var(--dsw-alias-label-secondary);font-weight:400;font-size:12px;opacity:.7}',
 			'.jr-error{margin-top:10px;padding:10px 12px;border-radius:8px;background:var(--dsw-alias-bg-layer-2);color:var(--dsw-alias-state-error-primary);font-size:13px}',
 			'.jr-spin{width:16px;height:16px;border:2px solid var(--dsw-alias-border-l2);border-top-color:var(--dsw-alias-brand-primary);border-radius:50%;animation:jr-rotate .8s linear infinite;display:inline-block;flex:none}',
 			'@keyframes jr-rotate{to{transform:rotate(360deg)}}',
@@ -1104,8 +1119,55 @@ window.__ModuleLoader__.load({
 			h('rect', { x: 11.8, y: 12.6, width: 2.8, height: 2.8, rx: .7, fill: 'currentColor' })
 		);
 
-		function MagazineCard({ mag, t, onOpen, savedSet }) {
-			const issues = mag.issues || [];
+		/**
+		 * 一行一刊的刊物条目。
+		 *
+		 * 折叠时只显示刊物信息 + 最新一期；点开才拉取完整期号列表
+		 * （/jr/api/mag-issues），展开的列表在文档流里排布，没有内部滚动条。
+		 */
+		function MagazineRow({ mag, t, onOpen, savedSet, expanded, onToggle }) {
+			const cadence = mag.cadence === 'weekly' ? t('weekly') : mag.cadence === 'biweekly' ? t('biweekly') : t('monthly');
+			const latest = mag.latest;
+			const latestPath = latest ? (latest.logicalPath || latest.path) : null;
+			return h('div', { className: 'jr-mag', 'data-open': expanded ? 'true' : undefined },
+				h('div', { className: 'jr-mag-row' },
+					h('button', {
+						className: 'jr-mag-info',
+						style: { display: 'flex', alignItems: 'center', gap: '12px', background: 'none', border: 0, padding: 0, color: 'inherit', font: 'inherit', textAlign: 'left', cursor: 'pointer', flex: 1, minWidth: 0 },
+						onClick: onToggle,
+						'aria-expanded': expanded
+					},
+						h('div', { className: 'jr-chip', style: { background: mag.color } }, mag.title.charAt(0)),
+						h('div', { style: { minWidth: 0 } },
+							h('div', { className: 'jr-mag-name' }, mag.title),
+							h('div', { className: 'jr-mag-meta' },
+								`${mag.zh} · ${cadence} · ${t('issuesCount').replace('{n}', String(mag.count ?? 0))}`)
+						)
+					),
+					latestPath ? h('div', { className: 'jr-mag-latest' },
+						h('button', {
+							className: 'jr-latest-date',
+							style: { background: 'none', border: 0, padding: 0, font: 'inherit', color: 'inherit', cursor: 'pointer' },
+							onClick: () => onOpen(latestPath),
+							title: t('latest')
+						}, latest.date),
+						h('span', { className: 'jr-latest-tag' }, t('latest')),
+						savedSet && savedSet.has(latestPath) ? h('span', { className: 'jr-issue-saved' }, t('saved')) : null
+					) : null,
+					h('button', {
+						className: 'jr-toggle',
+						onClick: onToggle,
+						'aria-expanded': expanded,
+						'data-open': expanded ? 'true' : undefined,
+						title: expanded ? t('less') : t('more')
+					}, '▸')
+				),
+				mag.error ? h('div', { className: 'jr-error', style: { margin: '0 14px 10px' } }, mag.error) : null
+			);
+		}
+
+		/** 展开后的期号列表：按年/月分组，最新一期置顶高亮。 */
+		function IssueList({ mag, issues, t, onOpen, savedSet }) {
 			const byMonth = mag.cadence !== 'monthly';
 			const groups = [];
 			for (const issue of issues) {
@@ -1114,15 +1176,12 @@ window.__ModuleLoader__.load({
 				if (last && last.month === key) last.items.push(issue);
 				else groups.push({ month: key, items: [issue] });
 			}
-			const [openMonths, setOpenMonths] = useState(() => new Set(issues.length ? [byMonth ? issues[0].date.slice(0, 7) : issues[0].date.slice(0, 4)] : []));
-			const toggleMonth = (month) => setOpenMonths((current) => {
-				const next = new Set(current);
-				if (next.has(month)) next.delete(month);
-				else next.add(month);
-				return next;
-			});
-			const issueRow = (issue, isLatest) => h('div', { key: issue.logicalPath || issue.path, style: { display: 'flex', alignItems: 'center' } },
+			const issueRow = (issue, isLatest) => h('div', {
+				key: issue.logicalPath || issue.path,
+				style: { display: 'flex', alignItems: 'center' }
+			},
 				h('button', { className: 'jr-issue', style: { flex: 1 }, onClick: () => onOpen(issue.logicalPath || issue.path) },
+					// 徽标放在日期里，跟日期挨着；否则 flex 会把它们甩到行的另一头。
 					h('span', { className: 'jr-issue-date' },
 						issue.date,
 						isLatest ? h('span', { className: 'jr-issue-latest' }, t('latest')) : null,
@@ -1135,37 +1194,55 @@ window.__ModuleLoader__.load({
 					target: '_blank', rel: 'noreferrer'
 				}, t('onGithub'))
 			);
-			const cadence = mag.cadence === 'weekly' ? t('weekly') : mag.cadence === 'biweekly' ? t('biweekly') : t('monthly');
-			return h('div', { className: 'jr-mag' },
-				h('div', { className: 'jr-mag-head' },
-					h('div', { className: 'jr-chip', style: { background: mag.color } }, mag.title.charAt(0)),
-					h('div', { style: { minWidth: 0, flex: 1 } },
-						h('div', { className: 'jr-mag-name' }, mag.title),
-						h('div', { className: 'jr-mag-meta' }, `${mag.zh} · ${cadence}${issues.length ? ` · ${t('issuesCount').replace('{n}', String(issues.length))}` : ''}`)
-					)
-				),
-				mag.error ? h('div', { className: 'jr-error' }, mag.error) : null,
-				!mag.error && issues.length ? h('div', { className: 'jr-issues' },
-					groups.map((group) => {
-						const open = openMonths.has(group.month);
-						return h('div', { key: group.month },
-							h('button', {
-								className: 'jr-month',
-								onClick: () => toggleMonth(group.month),
-								'aria-expanded': open
-							},
-								h('span', { className: 'jr-month-chevron' }, open ? '▾' : '▸'),
-								h('span', null, group.month),
-								h('span', { className: 'jr-month-count' }, String(group.items.length))
-							),
-							open ? group.items.map((issue, index) => issueRow(issue, index === 0 && group.month === groups[0].month)) : null
-						);
-					})
-				) : null
+			return h('div', { className: 'jr-issues' },
+				groups.map((group) => h('div', { key: group.month },
+					h('div', { className: 'jr-month', style: { cursor: 'default' } },
+						h('span', null, group.month),
+						h('span', { className: 'jr-month-count' }, String(group.items.length))
+					),
+					group.items.map((issue, index) => issueRow(issue, index === 0 && group.month === groups[0].month))
+				))
 			);
 		}
 
 		function ShelfView({ data, loading, error, t, onRefresh, onOpen, onRetry, savedSet }) {
+			// 展开的刊物 key，以及它们已加载的期号列表。
+			const [openKeys, setOpenKeys] = useState(() => new Set());
+			const [issueLists, setIssueLists] = useState({});
+			const [loadingKeys, setLoadingKeys] = useState(() => new Set());
+
+			const toggle = useCallback((mag) => {
+				const key = mag.key;
+				setOpenKeys((current) => {
+					const next = new Set(current);
+					if (next.has(key)) { next.delete(key); return next; }
+					next.add(key);
+					// 第一次展开时才去拉完整期号列表。
+					if (!issueLists[key] && !loadingKeys.has(key)) {
+						setLoadingKeys((cur) => new Set(cur).add(key));
+						fetch(`/jr/api/mag-issues?mag=${encodeURIComponent(key)}`)
+							.then((res) => {
+								if (!res.ok) throw new Error(`HTTP ${res.status}`);
+								return res.json();
+							})
+							.then((payload) => {
+								setIssueLists((cur) => ({ ...cur, [key]: payload.issues || [] }));
+							})
+							.catch(() => {
+								setIssueLists((cur) => ({ ...cur, [key]: [] }));
+							})
+							.finally(() => {
+								setLoadingKeys((cur) => {
+									const next = new Set(cur);
+									next.delete(key);
+									return next;
+								});
+							});
+					}
+					return next;
+				});
+			}, [issueLists, loadingKeys]);
+
 			if (loading) return h('div', { className: 'jr-center' }, h('span', { className: 'jr-spin' }), t('loading'));
 			if (error) return h('div', { className: 'jr-shell' },
 				h('div', { className: 'jr-error' }, error),
@@ -1181,7 +1258,29 @@ window.__ModuleLoader__.load({
 					h('button', { className: 'jr-btn', onClick: onRefresh }, t('refresh'))
 				),
 				h('div', { className: 'jr-grid' },
-					magazines.map((mag) => h(MagazineCard, { key: mag.key, mag, t, onOpen, savedSet }))
+					magazines.map((mag) => {
+						const expanded = openKeys.has(mag.key);
+						const issues = issueLists[mag.key];
+						return h('div', { key: mag.key },
+							h(MagazineRow, {
+								mag, t, onOpen, savedSet,
+								expanded,
+								onToggle: () => toggle(mag)
+							}),
+							expanded ? (loadingKeys.has(mag.key)
+								? h('div', { className: 'jr-issues' },
+									h('div', { className: 'jr-hint' },
+										h('span', { className: 'jr-spin', style: { width: 12, height: 12, marginRight: 6 } }),
+										t('loading'))
+								)
+								: issues && issues.length
+									? h(IssueList, { mag, issues, t, onOpen, savedSet })
+									: issues && !issues.length
+										? h('div', { className: 'jr-issues' }, h('div', { className: 'jr-hint' }, t('noIssues')))
+										: null
+							) : null
+						);
+					})
 				),
 				h('div', { className: 'jr-hint', style: { marginTop: 16 } }, t('selectHint'))
 			);
@@ -2170,6 +2269,8 @@ window.__ModuleLoader__.load({
 		const SAVED_KEY = 'journal.reader.saved';
 		const SESSION_KEY = 'journal.reader.session';
 		const CHATS_KEY = 'journal.reader.chats';
+		// 期刊架摘要的本地缓存：首屏直接渲染，不用等网络。
+		const SHELF_KEY = 'journal.reader.shelf';
 
 		function SpeechBar({ speech, t, onToggle, onStop, onJump, onRate, onVoice, onClose }) {
 			const playing = speech.status === 'playing';
@@ -2252,12 +2353,29 @@ window.__ModuleLoader__.load({
 			});
 
 			const loadShelf = useCallback(async (refresh) => {
-				setShelf({ loading: true, error: null, data: null });
+				// 先用本地缓存渲染，界面立刻出内容；再后台拉新数据覆盖。
+				// 之前是「等网络 → 才有界面」，首屏白屏近 1.5 秒。
+				if (!refresh) {
+					const cached = readJson(SHELF_KEY, null);
+					if (cached && Array.isArray(cached.magazines) && cached.magazines.length) {
+						setShelf({ loading: false, error: null, data: cached });
+					} else {
+						setShelf({ loading: true, error: null, data: null });
+					}
+				} else {
+					setShelf((current) => ({ ...current, loading: true, error: null }));
+				}
 				try {
 					const data = await getJson(`/jr/api/issues${refresh ? '?refresh=1' : ''}`);
 					setShelf({ loading: false, error: null, data });
+					writeJson(SHELF_KEY, { magazines: data.magazines, at: Date.now() });
 				} catch (err) {
-					setShelf({ loading: false, error: String(err.message || err), data: null });
+					// 拉取失败时保留已渲染的缓存内容，只在什么都没有时才报错。
+					setShelf((current) => (
+						current.data
+							? { ...current, loading: false, error: null }
+							: { loading: false, error: String(err.message || err), data: null }
+					));
 				}
 			}, []);
 			useEffect(() => { loadShelf(false); }, [loadShelf]);
