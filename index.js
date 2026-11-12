@@ -17,10 +17,16 @@ import os from 'node:os';
 import zlib from 'node:zlib';
 
 // —— 数据源 ——
-// 一份刊物可以来自多个仓库：hehonghui 的合集仓库覆盖广，
-// Monkfishare 用爬虫维护、刊物更全但目录结构不同（<刊>/<年>/<期号>/）。
+// 一份刊物可以来自不同仓库：hehonghui 的合集仓库覆盖广，
+// Monkfishare 用爬虫维护、一刊一仓库，目录结构也不同（<刊>/<年>/<期号>/）。
 // source 描述去哪里取、prefix 描述仓库里的路径前缀，
 // issuePattern 把仓库里的期号目录名翻译成插件内部统一的 YYYY-MM-DD。
+//
+// 期号目录名的形态不止一种：
+//   01_economist/te_2026.11.07   周刊，精确到日
+//   TM/2026/2026-11-09            双周刊，精确到日
+//   SA/2026/2026-11               月刊，只有年月
+// 所以 issuePattern 允许缺日期段，缺的那位补 01。
 const SOURCES = [
 	{
 		id: 'hehonghui',
@@ -32,13 +38,22 @@ const SOURCES = [
 		issuePattern: /^(?:[A-Za-z0-9]+_)?(\d{4})\.(\d{2})\.(\d{2})$/
 	},
 	{
-		id: 'monkfishare',
+		id: 'monkfishare-time',
 		owner: 'Monkfishare',
 		repo: 'TIME_magazine',
 		branch: 'main',
 		prefix: 'TM',
 		// Monkfishare: TM/2026/2026-11-09
 		issuePattern: /^(\d{4})-(\d{2})-(\d{2})$/
+	},
+	{
+		id: 'monkfishare-sa',
+		owner: 'Monkfishare',
+		repo: 'Scientific_American',
+		branch: 'main',
+		prefix: 'SA',
+		// Monkfishare: SA/2026/2026-11（月刊，只有年月）
+		issuePattern: /^(\d{4})-(\d{2})$/
 	}
 ];
 
@@ -47,11 +62,12 @@ const MAGAZINES = [
 	{ key: '02_new_yorker', title: 'The New Yorker', zh: '纽约客', cadence: 'weekly', color: '#1f2937', source: 'hehonghui' },
 	{ key: '04_atlantic', title: 'The Atlantic', zh: '大西洋月刊', cadence: 'monthly', color: '#1d4ed8', source: 'hehonghui' },
 	{ key: '05_wired', title: 'WIRED', zh: '连线', cadence: 'monthly', color: '#b45309', source: 'hehonghui' },
-	{ key: '06_time', title: 'TIME', zh: '时代周刊', cadence: 'biweekly', color: '#c8102e', source: 'monkfishare' }
+	{ key: '06_time', title: 'TIME', zh: '时代周刊', cadence: 'biweekly', color: '#c8102e', source: 'monkfishare-time' },
+	{ key: '07_scientific_american', title: 'Scientific American', zh: '科学美国人', cadence: 'monthly', color: '#0f7b6c', source: 'monkfishare-sa' }
 ];
 
-// 仓库里期号目录名的两种形态都要认：2026.11.07 与 2026-11-07。
-const ISSUE_DIR_RE = /^(?:[A-Za-z0-9]+_)?(\d{4})[.\-](\d{2})[.\-](\d{2})$/;
+// 仓库里期号目录名的形态：2026.11.07 / 2026-11-09 / 2026-11（只有年月）。
+const ISSUE_DIR_RE = /^(?:[A-Za-z0-9]+_)?(\d{4})[.\-](\d{2})(?:[.\-](\d{2}))?$/;
 const YEAR_DIR_RE = /^\d{4}$/;
 const SLUG_TITLE_RE = /^\S+\.\d{4}\.\d{2}\.\d{2}$/;
 const LISTING_TTL_MS = 10 * 60 * 1000;
@@ -59,6 +75,18 @@ const MAX_EXPLAIN_CHARS = 2000;
 
 function sourceById(id) {
 	return SOURCES.find((s) => s.id === id) || SOURCES[0];
+}
+
+/**
+ * 把期号目录名解析成统一的 YYYY-MM-DD。
+ * 月刊只有年月（2026-11），日期位补 01。
+ */
+function issueDate(match) {
+	if (!match) return null;
+	const year = match[1];
+	const month = match[2];
+	const day = match[3] || '01';
+	return `${year}-${month}-${day}`;
 }
 
 const listingCache = new Map();
@@ -344,15 +372,17 @@ function issuesFromTree(treeData, source) {
 		if (!match) continue;
 		// 中间层若是年份目录，跳过它。
 		if (parts.length === 3 && !YEAR_DIR_RE.test(parts[1])) continue;
+		const date = issueDate(match);
+		if (!date) continue;
 		byMag.get(magKey).push({
 			dir: last,
 			path: node.path,
 			// 客户端用统一的逻辑路径，仓库原始路径另存（下载时要用）。
-			logicalPath: `${magKey}/${match[1]}-${match[2]}-${match[3]}`,
-			date: `${match[1]}-${match[2]}-${match[3]}`
+			logicalPath: `${magKey}/${date}`,
+			date
 		});
 		// 记下「逻辑路径 → 仓库路径」，后面解析章节时直接查表拿真实目录名。
-		issuePathMap.set(`${magKey}/${match[1]}-${match[2]}-${match[3]}`, node.path);
+		issuePathMap.set(`${magKey}/${date}`, node.path);
 	}
 	return mags.map((mag) => {
 		const issues = (byMag.get(mag.key) || []).sort((a, b) => (a.date < b.date ? 1 : a.date > b.date ? -1 : 0));
@@ -460,9 +490,9 @@ function resolveIssuePath(issuePath) {
 	if (!mag) return null;
 	const source = sourceById(mag.source);
 	const raw = parts[1] || '';
-	// 期号目录名可能是 te_2026.11.07 / 2026-11-09 / 2026.11.07。
+	// 期号目录名可能是 te_2026.11.07 / 2026-11-09 / 2026-11。
 	const match = ISSUE_DIR_RE.exec(raw);
-	const date = match ? `${match[1]}-${match[2]}-${match[3]}` : raw.replace(/-/g, '.');
+	const date = issueDate(match) || raw.replace(/-/g, '.');
 	const logical = `${mag.key}/${date}`;
 
 	// 优先用 tree 里记下的真实仓库路径。
@@ -472,7 +502,9 @@ function resolveIssuePath(issuePath) {
 	// 兜底：按常见形态猜。
 	if (source.prefix) {
 		const year = date.slice(0, 4);
+		const month = date.slice(5, 7);
 		candidates.push(`${source.prefix}/${year}/${date}`);
+		candidates.push(`${source.prefix}/${year}/${month}`);          // 月刊：只有年月
 		candidates.push(`${source.prefix}/${year}/${date.replace(/-/g, '.')}`);
 	}
 	if (raw && raw !== date) candidates.push(`${mag.key}/${raw}`);

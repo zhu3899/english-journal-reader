@@ -1,6 +1,6 @@
 # 外刊精读台 · English Journal Reader
 
-一个长在 AI 助手里的英文外刊阅读器 —— [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) 插件。数据来自 [awesome-english-ebooks](https://github.com/hehonghui/awesome-english-ebooks) 与 [Monkfishare](https://github.com/Monkfishare) 的爬虫仓库（经济学人、纽约客、大西洋月刊、连线、时代周刊，每周/每两周更新）。
+一个长在 AI 助手里的英文外刊阅读器 —— [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) 插件。数据来自 [awesome-english-ebooks](https://github.com/hehonghui/awesome-english-ebooks) 与 [Monkfishare](https://github.com/Monkfishare) 的爬虫仓库（经济学人、纽约客、大西洋月刊、连线、时代周刊、科学美国人，每周/每两周/每月更新）。
 
 > 别的阅读器只能"看"，它能"问"。
 
@@ -11,7 +11,7 @@
 ## ✨ 功能
 
 ### 📖 期刊架
-- 五本刊物卡片化展示，按「年-月」（周刊）/「年」（月刊）分组折叠，全量归档一键展开
+- 六本刊物卡片化展示，按「年-月」（周刊）/「年」（月刊）分组折叠，全量归档一键展开
 - 每期一键阅读、GitHub 原页跳转、epub 下载
 - **读过即收藏**：打开某一期，epub 自动存入本地期刊库（默认 `下载\EnglishJournals\<刊名>\`），已收藏期显示「已存」徽标
 
@@ -21,9 +21,10 @@
 | 源 | 刊物 | 更新 |
 |---|---|---|
 | `hehonghui/awesome-english-ebooks` | 经济学人、纽约客、大西洋月刊、连线 | 每周 |
-| `Monkfishare/*_magazine` | 时代周刊（其余刊物仓库同样活跃） | 每周 |
+| `Monkfishare/TIME_magazine` | 时代周刊 | 每两周 |
+| `Monkfishare/Scientific_American` | 科学美国人 | 每月 |
 
-两个源的仓库目录结构不同（`01_economist/te_2026.11.07` vs `TM/2026/2026-11-09`），插件用**统一的逻辑路径**（`<刊物>/<YYYY-MM-DD>`）对外暴露，真实仓库路径在解析期号树时记入映射表，下载时再查表还原——不靠猜目录名。
+三个源的仓库目录结构不同（`01_economist/te_2026.11.07` / `TM/2026/2026-11-09` / `SA/2026/2026-11`），插件用**统一的逻辑路径**（`<刊物>/<YYYY-MM-DD>`）对外暴露，真实仓库路径在解析期号树时记入映射表，下载时再查表还原——不靠猜目录名。
 
 ### 📚 双模式阅读器
 - **文字版**：epub 自动下载解包（自研 zip reader），按 spine 拆章；章节进度记忆、字号调节、深浅色主题跟随、图片同源代理加载
