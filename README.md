@@ -4,7 +4,8 @@
 
 > 别的阅读器只能"看"，它能"问"。
 
-<img width="1410" height="1303" alt="image" src="https://github.com/user-attachments/assets/c19c1a34-4f09-40df-8ef3-7683558e987a" />
+<img width="1265" height="698" alt="image" src="https://github.com/user-attachments/assets/a121c876-2386-4ff6-b77d-aeb365ea4d28" />
+
 <img width="2205" height="1333" alt="image" src="https://github.com/user-attachments/assets/5ff7d0e5-88a8-4904-8967-2ccde621ac1f" />
 
 
