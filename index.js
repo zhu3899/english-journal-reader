@@ -16,23 +16,57 @@ import path from 'node:path';
 import os from 'node:os';
 import zlib from 'node:zlib';
 
-const REPO = { owner: 'hehonghui', repo: 'awesome-english-ebooks', branch: 'master' };
-const MAGAZINES = [
-	{ key: '01_economist', title: 'The Economist', zh: '经济学人', cadence: 'weekly', color: '#e3120b' },
-	{ key: '02_new_yorker', title: 'The New Yorker', zh: '纽约客', cadence: 'weekly', color: '#1f2937' },
-	{ key: '04_atlantic', title: 'The Atlantic', zh: '大西洋月刊', cadence: 'monthly', color: '#1d4ed8' },
-	{ key: '05_wired', title: 'WIRED', zh: '连线', cadence: 'monthly', color: '#b45309' }
+// —— 数据源 ——
+// 一份刊物可以来自多个仓库：hehonghui 的合集仓库覆盖广，
+// Monkfishare 用爬虫维护、刊物更全但目录结构不同（<刊>/<年>/<期号>/）。
+// source 描述去哪里取、prefix 描述仓库里的路径前缀，
+// issuePattern 把仓库里的期号目录名翻译成插件内部统一的 YYYY-MM-DD。
+const SOURCES = [
+	{
+		id: 'hehonghui',
+		owner: 'hehonghui',
+		repo: 'awesome-english-ebooks',
+		branch: 'master',
+		prefix: '',
+		// hehonghui: 01_economist/te_2026.11.07
+		issuePattern: /^(?:[A-Za-z0-9]+_)?(\d{4})\.(\d{2})\.(\d{2})$/
+	},
+	{
+		id: 'monkfishare',
+		owner: 'Monkfishare',
+		repo: 'TIME_magazine',
+		branch: 'main',
+		prefix: 'TM',
+		// Monkfishare: TM/2026/2026-11-09
+		issuePattern: /^(\d{4})-(\d{2})-(\d{2})$/
+	}
 ];
-const ISSUE_DIR_RE = /^(?:[A-Za-z0-9]+_)?(\d{4})\.(\d{2})\.(\d{2})$/;
+
+const MAGAZINES = [
+	{ key: '01_economist', title: 'The Economist', zh: '经济学人', cadence: 'weekly', color: '#e3120b', source: 'hehonghui' },
+	{ key: '02_new_yorker', title: 'The New Yorker', zh: '纽约客', cadence: 'weekly', color: '#1f2937', source: 'hehonghui' },
+	{ key: '04_atlantic', title: 'The Atlantic', zh: '大西洋月刊', cadence: 'monthly', color: '#1d4ed8', source: 'hehonghui' },
+	{ key: '05_wired', title: 'WIRED', zh: '连线', cadence: 'monthly', color: '#b45309', source: 'hehonghui' },
+	{ key: '06_time', title: 'TIME', zh: '时代周刊', cadence: 'biweekly', color: '#c8102e', source: 'monkfishare' }
+];
+
+// 仓库里期号目录名的两种形态都要认：2026.11.07 与 2026-11-07。
+const ISSUE_DIR_RE = /^(?:[A-Za-z0-9]+_)?(\d{4})[.\-](\d{2})[.\-](\d{2})$/;
 const YEAR_DIR_RE = /^\d{4}$/;
 const SLUG_TITLE_RE = /^\S+\.\d{4}\.\d{2}\.\d{2}$/;
 const LISTING_TTL_MS = 10 * 60 * 1000;
 const MAX_EXPLAIN_CHARS = 2000;
 
+function sourceById(id) {
+	return SOURCES.find((s) => s.id === id) || SOURCES[0];
+}
+
 const listingCache = new Map();
 const parsedCache = new Map();
 const inflight = new Map();
 const transCache = new Map();
+// 逻辑路径 → 仓库真实路径。解析期号树时建立，避免猜目录名（te_ 这类前缀无法枚举）。
+const issuePathMap = new Map();
 const cacheDir = path.join(os.tmpdir(), 'dsh-journal-reader');
 // Persistent app-state file (chats archive, saved marks, reading progress, settings).
 // DSH_PROFILE_DIR is NOT set in the app process, so locate the profile from this package's own
@@ -92,13 +126,21 @@ function magForPath(issuePath) {
 
 /** Ensure the issue's epub exists in the local library folder; returns the absolute saved path. */
 async function saveToLibrary(issuePath) {
-	const mag = magForPath(issuePath);
-	if (!mag) throw new Error(`unknown magazine for path: ${issuePath}`);
-	const rows = await cachedListing(issuePath, false, undefined);
-	const epubFile = rows.find((row) => row.type === 'file' && /\.epub$/i.test(row.name));
+	const resolved = resolveIssuePath(issuePath);
+	if (!resolved) throw new Error(`unknown magazine for path: ${issuePath}`);
+	const { mag, source, date, candidates } = resolved;
+	let epubFile = null;
+	let usedPath = null;
+	for (const candidate of candidates) {
+		try {
+			const rows = await cachedListing(candidate, false, undefined, source);
+			const found = rows.find((row) => row.type === 'file' && /\.epub$/i.test(row.name));
+			if (found) { epubFile = found; usedPath = candidate; break; }
+		} catch {}
+	}
 	if (!epubFile) throw new Error('this issue has no epub file');
-	const buffer = await loadEpub(issuePath, epubFile.name);
-	const target = libraryPathFor(mag.title, issuePath.split('/').pop().replace(/^(?:.*?_)?(\d{4})\.(\d{2})\.(\d{2})$/, '$1-$2-$3'));
+	const buffer = await loadEpub(usedPath, epubFile.name, source);
+	const target = libraryPathFor(mag.title, date);
 	await fs.mkdir(path.dirname(target), { recursive: true });
 	await fs.writeFile(target, buffer);
 	return target;
@@ -106,7 +148,7 @@ async function saveToLibrary(issuePath) {
 
 async function handleRead(ctx, url, res) {
 	const issuePath = url.searchParams.get('path');
-	if (!issuePath || issuePath.includes('..') || !/^[0-9a-z_]+(?:\/[0-9a-z_.]+){1,3}$/i.test(issuePath)) return fail(res, 'invalid issue path', 400);
+	if (!issuePath || issuePath.includes('..') || !/^[0-9a-z_]+(?:\/[0-9a-z_.:-]+){1,3}$/i.test(issuePath)) return fail(res, 'invalid issue path', 400);
 	try {
 		const file = await saveToLibrary(issuePath);
 		sendJson(res, 200, { saved: true, file });
@@ -240,10 +282,10 @@ function rateLimitMessage(token) {
 		+ 'Sign in with the GitHub CLI (gh auth login) so the plugin can use a higher limit.';
 }
 
-async function fetchIssueTree(signal) {
-	const api = `https://api.github.com/repos/${REPO.owner}/${REPO.repo}/git/trees/${REPO.branch}?recursive=1`;
+async function fetchIssueTree(signal, source) {
+	const api = `https://api.github.com/repos/${source.owner}/${source.repo}/git/trees/${source.branch}?recursive=1`;
 	const state = readState();
-	const saved = state.tree || null;
+	const saved = (state.trees || {})[source.id] || null;
 	const headers = {
 		accept: 'application/vnd.github+json',
 		'user-agent': 'dsh-journal-reader-plugin (+https://github.com/hehonghui/awesome-english-ebooks)'
@@ -256,7 +298,9 @@ async function fetchIssueTree(signal) {
 		if (res.status === 304 && saved) return saved.data;
 		if (res.ok) {
 			const data = await res.json();
-			mergeState('tree', { at: Date.now(), etag: res.headers.get('etag') || null, data });
+			const trees = { ...(state.trees || {}) };
+			trees[source.id] = { at: Date.now(), etag: res.headers.get('etag') || null, data };
+			mergeState('trees', trees);
 			return data;
 		}
 		if (res.status === 403) throw new Error(rateLimitMessage(token));
@@ -271,27 +315,61 @@ async function fetchIssueTree(signal) {
 	}
 }
 
-/** Build the magazines/issues structure from one recursive tree response. */
-function issuesFromTree(treeData) {
-	const byMag = new Map(MAGAZINES.map((m) => [m.key, []]));
+/**
+ * Build the magazines/issues structure from one recursive tree response.
+ * 只挑属于该 source 的刊物；期号目录名按 source.issuePattern 解析。
+ *
+ * 仓库里的顶层目录名不一定等于刊物的 key：
+ *   hehonghui   01_economist/te_2026.11.07   （顶层 = key）
+ *   monkfishare TM/2026/2026-11-09          （顶层 = source.prefix）
+ * 所以先用 prefix/key 两种方式去找刊物，再取期号目录。
+ */
+function issuesFromTree(treeData, source) {
+	const mags = MAGAZINES.filter((m) => m.source === source.id);
+	const byMag = new Map(mags.map((m) => [m.key, []]));
+	// 顶层目录名 → 刊物 key
+	const dirToMag = new Map();
+	for (const m of mags) {
+		dirToMag.set(m.key, m.key);
+		if (source.prefix) dirToMag.set(source.prefix, m.key);
+	}
 	for (const node of treeData.tree || []) {
 		if (node.type !== 'tree') continue;
 		const parts = node.path.split('/');
 		if (parts.length < 2 || parts.length > 3) continue;
-		const magKey = parts[0];
-		if (!byMag.has(magKey)) continue;
-		const match = ISSUE_DIR_RE.exec(node.path.split('/').pop());
+		const magKey = dirToMag.get(parts[0]);
+		if (!magKey) continue;
+		const last = parts[parts.length - 1];
+		const match = source.issuePattern.exec(last) || ISSUE_DIR_RE.exec(last);
 		if (!match) continue;
-		byMag.get(magKey).push({ dir: node.path.split('/').pop(), path: node.path, date: `${match[1]}-${match[2]}-${match[3]}` });
+		// 中间层若是年份目录，跳过它。
+		if (parts.length === 3 && !YEAR_DIR_RE.test(parts[1])) continue;
+		byMag.get(magKey).push({
+			dir: last,
+			path: node.path,
+			// 客户端用统一的逻辑路径，仓库原始路径另存（下载时要用）。
+			logicalPath: `${magKey}/${match[1]}-${match[2]}-${match[3]}`,
+			date: `${match[1]}-${match[2]}-${match[3]}`
+		});
+		// 记下「逻辑路径 → 仓库路径」，后面解析章节时直接查表拿真实目录名。
+		issuePathMap.set(`${magKey}/${match[1]}-${match[2]}-${match[3]}`, node.path);
 	}
-	return MAGAZINES.map((mag) => {
+	return mags.map((mag) => {
 		const issues = (byMag.get(mag.key) || []).sort((a, b) => (a.date < b.date ? 1 : a.date > b.date ? -1 : 0));
-		return { ...mag, issues, latest: issues[0] ?? null, error: null };
+		return {
+			...mag,
+			issues,
+			latest: issues[0] ?? null,
+			error: null,
+			// 客户端用它拼「GitHub 原页」链接。
+			repo: { owner: source.owner, repo: source.repo, branch: source.branch }
+		};
 	});
 }
 
-async function ghContents(query, signal) {
-	const api = `https://api.github.com/repos/${REPO.owner}/${REPO.repo}/contents/${query.split('/').map(encodeURIComponent).join('/')}?ref=${REPO.branch}`;
+async function ghContents(query, signal, source) {
+	const src = source || SOURCES[0];
+	const api = `https://api.github.com/repos/${src.owner}/${src.repo}/contents/${query.split('/').map(encodeURIComponent).join('/')}?ref=${src.branch}`;
 	const cached = listingCache.get(query);
 	const headers = {
 		accept: 'application/vnd.github+json',
@@ -322,7 +400,7 @@ async function ghContents(query, signal) {
 	}
 }
 
-async function cachedListing(dirPath, force, signal) {
+async function cachedListing(dirPath, force, signal, source) {
 	const hit = listingCache.get(dirPath);
 	if (!force && hit && Date.now() - hit.at < LISTING_TTL_MS) return hit.data;
 	const pending = inflight.get(dirPath);
@@ -336,7 +414,7 @@ async function cachedListing(dirPath, force, signal) {
 				listingCache.set(dirPath, { at: saved.at, data: saved.data, etag: saved.etag || null });
 				return saved.data;
 			}
-			const { data, etag } = await ghContents(dirPath, signal);
+			const { data, etag } = await ghContents(dirPath, signal, source);
 			listingCache.set(dirPath, { at: Date.now(), data, etag });
 			const listings = (readState().listings || {});
 			listings[dirPath] = { at: Date.now(), data, etag };
@@ -361,32 +439,78 @@ async function cachedListing(dirPath, force, signal) {
 	return task;
 }
 
-function rawUrl(...segments) {
-	return `https://raw.githubusercontent.com/${REPO.owner}/${REPO.repo}/${REPO.branch}/${segments.map(encodeURIComponent).join('/')}`;
+function rawUrl(source, ...segments) {
+	return `https://raw.githubusercontent.com/${source.owner}/${source.repo}/${source.branch}/${segments.map(encodeURIComponent).join('/')}`;
+}
+
+/**
+ * 把客户端传来的逻辑期号路径解析成「去哪个仓库取、仓库里的路径是什么」。
+ *
+ * 客户端只认统一的 `<magKey>/<YYYY-MM-DD>`（如 06_time/2026-11-09），
+ * 而仓库里的目录名五花八门：
+ *   hehonghui   01_economist/te_2026.11.07   ← 带刊名缩写前缀
+ *   monkfishare TM/2026/2026-11-09          ← 多一层年份
+ * 靠猜候选路径不可靠（te_ 这类前缀没法枚举），
+ * 所以以 tree 里读到的真实路径为准：issuePathMap 在解析期号树时建立
+ * 「逻辑路径 → 仓库路径」的映射，这里直接查表。
+ */
+function resolveIssuePath(issuePath) {
+	const parts = String(issuePath || '').split('/');
+	const mag = MAGAZINES.find((m) => m.key === parts[0]);
+	if (!mag) return null;
+	const source = sourceById(mag.source);
+	const raw = parts[1] || '';
+	// 期号目录名可能是 te_2026.11.07 / 2026-11-09 / 2026.11.07。
+	const match = ISSUE_DIR_RE.exec(raw);
+	const date = match ? `${match[1]}-${match[2]}-${match[3]}` : raw.replace(/-/g, '.');
+	const logical = `${mag.key}/${date}`;
+
+	// 优先用 tree 里记下的真实仓库路径。
+	const known = issuePathMap.get(logical);
+	const candidates = [];
+	if (known) candidates.push(known);
+	// 兜底：按常见形态猜。
+	if (source.prefix) {
+		const year = date.slice(0, 4);
+		candidates.push(`${source.prefix}/${year}/${date}`);
+		candidates.push(`${source.prefix}/${year}/${date.replace(/-/g, '.')}`);
+	}
+	if (raw && raw !== date) candidates.push(`${mag.key}/${raw}`);
+	candidates.push(`${mag.key}/${date.replace(/-/g, '.')}`);
+	candidates.push(`${mag.key}/${date}`);
+	return { mag, source, date, logical, candidates };
 }
 
 async function handleIssues(ctx, url, res) {
 	const force = url.searchParams.get('refresh') === '1';
 	if (force) parsedCache.clear();
 	try {
-		// One tree request serves the whole shelf (or a free 304 when nothing changed).
-		const treeData = await fetchIssueTree(undefined);
-		const magazines = issuesFromTree(treeData);
+		// 每个源一次 tree 请求；某个源挂了不影响其它源。
+		const results = await Promise.all(SOURCES.map(async (source) => {
+			const treeData = await fetchIssueTree(undefined, source);
+			return issuesFromTree(treeData, source);
+		}));
+		const magazines = results.flat();
 		const llm = ctx.get('llm');
 		sendJson(res, 200, {
 			magazines,
 			explainReady: Boolean(llm && typeof llm.stream === 'function'),
-			repoHtml: `https://github.com/${REPO.owner}/${REPO.repo}`
+			repoHtml: `https://github.com/${SOURCES[0].owner}/${SOURCES[0].repo}`
 		});
 	} catch (error) {
 		// Serve the persisted tree when quota/network fails, rather than an error page.
-		const saved = readState().tree;
-		if (saved && saved.data) {
+		const saved = readState().trees || {};
+		const magazines = SOURCES.flatMap((source) => {
+			const entry = saved[source.id];
+			if (!entry || !entry.data) return [];
+			try { return issuesFromTree(entry.data, source); } catch { return []; }
+		});
+		if (magazines.length) {
 			const llm = ctx.get('llm');
 			sendJson(res, 200, {
-				magazines: issuesFromTree(saved.data),
+				magazines,
 				explainReady: Boolean(llm && typeof llm.stream === 'function'),
-				repoHtml: `https://github.com/${REPO.owner}/${REPO.repo}`,
+				repoHtml: `https://github.com/${SOURCES[0].owner}/${SOURCES[0].repo}`,
 				stale: true
 			});
 			return;
@@ -398,7 +522,37 @@ async function handleIssues(ctx, url, res) {
 async function ensureParsed(issuePath) {
 	let entry = parsedCache.get(issuePath);
 	if (entry) return entry;
-	const rows = await cachedListing(issuePath, false, undefined);
+	let resolved = resolveIssuePath(issuePath);
+	if (!resolved) throw Object.assign(new Error('unknown magazine path'), { status: 404 });
+	const { mag, source, date, candidates } = resolved;
+
+	// 期号目录名在仓库里五花八门（te_ 前缀、多一层年份），猜不靠得住。
+	// 期刊架加载时会把真实路径记进 issuePathMap；若直接访问某一期（没先开架），
+	// 这里补拉一次 tree 把映射建起来。
+	if (!issuePathMap.has(resolved.logical)) {
+		try {
+			const treeData = await fetchIssueTree(undefined, source);
+			issuesFromTree(treeData, source);
+			resolved = resolveIssuePath(issuePath);
+		} catch {}
+	}
+	const paths = resolved.candidates;
+
+	// 仓库里的期号目录名可能与逻辑路径不同，逐个候选试探。
+	let rows = null;
+	let usedPath = null;
+	for (const candidate of paths) {
+		try {
+			const listing = await cachedListing(candidate, false, undefined, source);
+			if (listing && listing.some((row) => row.type === 'file' && /\.epub$/i.test(row.name))) {
+				rows = listing;
+				usedPath = candidate;
+				break;
+			}
+			if (!rows && listing) { rows = listing; usedPath = candidate; }
+		} catch {}
+	}
+	if (!rows) throw Object.assign(new Error('this issue has no epub file'), { status: 404 });
 	const epubFile = rows.find((row) => row.type === 'file' && /\.epub$/i.test(row.name));
 	if (!epubFile) throw Object.assign(new Error('this issue has no epub file'), { status: 404 });
 	const files = {};
@@ -408,15 +562,21 @@ async function ensureParsed(issuePath) {
 		if (/\.mobi$/i.test(row.name)) files.mobi = row.name;
 		if (/\.pdf$/i.test(row.name)) files.pdf = row.name;
 	}
-	const buffer = await loadEpub(issuePath, epubFile.name);
+	const buffer = await loadEpub(usedPath, epubFile.name, source);
 	const parsed = parseEpub(buffer);
 	const meta = {
 		path: issuePath,
-		dir: issuePath.split('/')[1],
-		date: issuePath.split('/').pop().replace(/^(?:.*?_)?(\d{4})\.(\d{2})\.(\d{2})$/, '$1-$2-$3'),
+		dir: date,
+		date,
+		title: `${mag.title} ${date}`,
+		magazine: mag.title,
 		epub: epubFile.name,
 		files,
-		rawBase: `${issuePath}/`,
+		rawBase: `${usedPath}/`,
+		repoPath: usedPath,
+		source: source.id,
+		// 客户端要用它拼 GitHub / raw 下载链接。
+		repo: { owner: source.owner, repo: source.repo, branch: source.branch },
 		chapters: parsed.chapters
 	};
 	entry = { meta, read: parsed.read, readBuffer: parsed.readBuffer };
@@ -440,7 +600,7 @@ const ASSET_TYPES = { jpg: 'image/jpeg', jpeg: 'image/jpeg', png: 'image/png', g
 async function handleAsset(ctx, url, res) {
 	const issuePath = url.searchParams.get('path');
 	const file = url.searchParams.get('file') || '';
-	if (!issuePath || issuePath.includes('..') || !/^[0-9a-z_]+(?:\/[0-9a-z_.]+){1,3}$/i.test(issuePath)) return fail(res, 'invalid issue path', 400);
+	if (!issuePath || issuePath.includes('..') || !/^[0-9a-z_]+(?:\/[0-9a-z_.:-]+){1,3}$/i.test(issuePath)) return fail(res, 'invalid issue path', 400);
 	if (!file || file.includes('..')) return fail(res, 'invalid asset path', 400);
 	const ext = (file.split('.').pop() || '').toLowerCase();
 	const contentType = ASSET_TYPES[ext];
@@ -460,7 +620,7 @@ async function handleAsset(ctx, url, res) {
 
 async function handleIssue(ctx, url, res) {
 	const issuePath = url.searchParams.get('path');
-	if (!issuePath || issuePath.includes('..') || !/^[0-9a-z_]+(?:\/[0-9a-z_.]+){1,3}$/i.test(issuePath)) return fail(res, 'invalid issue path', 400);
+	if (!issuePath || issuePath.includes('..') || !/^[0-9a-z_]+(?:\/[0-9a-z_.:-]+){1,3}$/i.test(issuePath)) return fail(res, 'invalid issue path', 400);
 	try {
 		const entry = await ensureParsed(issuePath);
 		sendJson(res, 200, entry.meta);
@@ -489,15 +649,15 @@ async function handleChapter(ctx, url, res) {
 	}
 }
 
-async function loadEpub(issuePath, fileName) {
+async function loadEpub(issuePath, fileName, source) {
 	await fs.mkdir(cacheDir, { recursive: true });
-	const safe = issuePath.replace(/[^0-9a-z_.]/gi, '_');
+	const safe = issuePath.replace(/[^0-9a-z_.-]/gi, '_');
 	const target = path.join(cacheDir, `${safe}.epub`);
 	try {
 		const stat = await fs.stat(target);
 		if (stat.isFile() && stat.size > 0) return await fs.readFile(target);
 	} catch {}
-	const res = await fetch(rawUrl(issuePath, fileName), {
+	const res = await fetch(rawUrl(source || SOURCES[0], issuePath, fileName), {
 		headers: { 'user-agent': 'dsh-journal-reader-plugin' }
 	});
 	if (!res.ok) throw new Error(`epub download failed: HTTP ${res.status}`);
@@ -506,15 +666,15 @@ async function loadEpub(issuePath, fileName) {
 	return buffer;
 }
 
-async function loadPdf(issuePath, fileName) {
+async function loadPdf(issuePath, fileName, source) {
 	await fs.mkdir(cacheDir, { recursive: true });
-	const safe = issuePath.replace(/[^0-9a-z_.]/gi, '_');
+	const safe = issuePath.replace(/[^0-9a-z_.-]/gi, '_');
 	const target = path.join(cacheDir, `${safe}.pdf`);
 	try {
 		const stat = await fs.stat(target);
 		if (stat.isFile() && stat.size > 0) return await fs.readFile(target);
 	} catch {}
-	const res = await fetch(rawUrl(issuePath, fileName), {
+	const res = await fetch(rawUrl(source || SOURCES[0], issuePath, fileName), {
 		headers: { 'user-agent': 'dsh-journal-reader-plugin' }
 	});
 	if (!res.ok) throw new Error(`pdf download failed: HTTP ${res.status}`);
@@ -525,12 +685,13 @@ async function loadPdf(issuePath, fileName) {
 
 async function handlePdf(ctx, url, res) {
 	const issuePath = url.searchParams.get('path');
-	if (!issuePath || issuePath.includes('..') || !/^[0-9a-z_]+(?:\/[0-9a-z_.]+){1,3}$/i.test(issuePath)) return fail(res, 'invalid issue path', 400);
+	if (!issuePath || issuePath.includes('..') || !/^[0-9a-z_]+(?:\/[0-9a-z_.:-]+){1,3}$/i.test(issuePath)) return fail(res, 'invalid issue path', 400);
 	try {
-		const rows = await cachedListing(issuePath, false, undefined);
-		const pdfFile = rows.find((row) => row.type === 'file' && /\.pdf$/i.test(row.name));
+		const entry = await ensureParsed(issuePath);
+		const pdfFile = entry.meta.files.pdf;
 		if (!pdfFile) return fail(res, 'this issue has no pdf file', 404);
-		const buffer = await loadPdf(issuePath, pdfFile.name);
+		const source = sourceById(entry.meta.source);
+		const buffer = await loadPdf(entry.meta.repoPath, pdfFile, source);
 		res.statusCode = 200;
 		res.setHeader('content-type', 'application/pdf');
 		res.setHeader('content-length', String(buffer.length));

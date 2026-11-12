@@ -31,6 +31,7 @@ window.__ModuleLoader__.load({
 			latest: '最新',
 			opening: '正在打开这一期…',
 			weekly: '周刊',
+			biweekly: '双周刊',
 			monthly: '月刊',
 			back: '返回期刊架',
 			toc: '目录',
@@ -92,6 +93,7 @@ window.__ModuleLoader__.load({
 			latest: 'Latest',
 			opening: 'Opening this issue…',
 			weekly: 'weekly',
+			biweekly: 'biweekly',
 			monthly: 'monthly',
 			back: 'Back to shelf',
 			toc: 'Contents',
@@ -1119,21 +1121,21 @@ window.__ModuleLoader__.load({
 				else next.add(month);
 				return next;
 			});
-			const issueRow = (issue, isLatest) => h('div', { key: issue.path, style: { display: 'flex', alignItems: 'center' } },
-				h('button', { className: 'jr-issue', style: { flex: 1 }, onClick: () => onOpen(issue.path) },
+			const issueRow = (issue, isLatest) => h('div', { key: issue.logicalPath || issue.path, style: { display: 'flex', alignItems: 'center' } },
+				h('button', { className: 'jr-issue', style: { flex: 1 }, onClick: () => onOpen(issue.logicalPath || issue.path) },
 					h('span', { className: 'jr-issue-date' },
 						issue.date,
 						isLatest ? h('span', { className: 'jr-issue-latest' }, t('latest')) : null,
-						savedSet && savedSet.has(issue.path) ? h('span', { className: 'jr-issue-saved' }, t('saved')) : null
+						savedSet && savedSet.has(issue.logicalPath || issue.path) ? h('span', { className: 'jr-issue-saved' }, t('saved')) : null
 					)
 				),
 				h('a', {
 					className: 'jr-link',
-					href: `https://github.com/hehonghui/awesome-english-ebooks/tree/master/${issue.path}`,
+					href: `https://github.com/${mag.repo ? mag.repo.owner : 'hehonghui'}/${mag.repo ? mag.repo.repo : 'awesome-english-ebooks'}/tree/${mag.repo ? mag.repo.branch : 'master'}/${issue.path}`,
 					target: '_blank', rel: 'noreferrer'
 				}, t('onGithub'))
 			);
-			const cadence = mag.cadence === 'weekly' ? t('weekly') : t('monthly');
+			const cadence = mag.cadence === 'weekly' ? t('weekly') : mag.cadence === 'biweekly' ? t('biweekly') : t('monthly');
 			return h('div', { className: 'jr-mag' },
 				h('div', { className: 'jr-mag-head' },
 					h('div', { className: 'jr-chip', style: { background: mag.color } }, mag.title.charAt(0)),
@@ -1987,7 +1989,7 @@ window.__ModuleLoader__.load({
 					}, viewMode === 'pdf' ? t('textMode') : t('pdf')) : null,
 					meta && meta.files && meta.files.epub ? h('a', {
 						className: 'jr-link',
-						href: `https://raw.githubusercontent.com/hehonghui/awesome-english-ebooks/master/${meta.path.split('/').map(encodeURIComponent).join('/')}/${encodeURIComponent(meta.files.epub)}`,
+						href: `https://raw.githubusercontent.com/${meta.repo ? meta.repo.owner : 'hehonghui'}/${meta.repo ? meta.repo.repo : 'awesome-english-ebooks'}/${meta.repo ? meta.repo.branch : 'master'}/${(meta.repoPath || meta.path).split('/').map(encodeURIComponent).join('/')}/${encodeURIComponent(meta.files.epub)}`,
 						target: '_blank', rel: 'noreferrer'
 					}, t('download')) : null
 				),
