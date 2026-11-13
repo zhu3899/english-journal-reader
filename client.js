@@ -1625,6 +1625,8 @@ window.__ModuleLoader__.load({
 			// 首次进入时的那一期。判断「换没换文章」要用它，不能用 magKey：
 			// 同一本刊物的不同期号 magKey 相同。
 			const initialPathRef = useRef(path);
+			// 记录是否已经加载过章节元信息，用来区分「首次加载」与「换章」。
+			const metaRef = useRef(null);
 
 			// —— 朗读 ——
 			const engineRef = useRef(null);
@@ -1756,6 +1758,10 @@ window.__ModuleLoader__.load({
 				const engine = engineRef.current;
 				if (engine) engine.stop();
 				setTransMap({});
+				// 换章就关掉「对照」：新章节不该一进来就自动翻译。
+				// 首次加载要保留 session 里恢复的开关，所以只在此后生效。
+				if (metaRef.current) setDual(false);
+				metaRef.current = meta;
 				const controller = new AbortController();
 				abortRef.current = controller;
 				setChapterLoading(true); setChapterError(null);
