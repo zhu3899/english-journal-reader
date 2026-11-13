@@ -1622,6 +1622,9 @@ window.__ModuleLoader__.load({
 			const chatInputRef = useRef(null);
 			const chatMsgsRef = useRef(null);
 			const initialMagRef = useRef(magKey);
+			// 首次进入时的那一期。判断「换没换文章」要用它，不能用 magKey：
+			// 同一本刊物的不同期号 magKey 相同。
+			const initialPathRef = useRef(path);
 
 			// —— 朗读 ——
 			const engineRef = useRef(null);
@@ -1682,8 +1685,13 @@ window.__ModuleLoader__.load({
 				// Restoring a session keeps the saved toggle; switching to another issue resets it
 				// and loads that issue's archived conversation — but never auto-opens the panel:
 				// once the user closes it, it stays closed until they reopen it themselves.
-				setDual(magKey === initialMagRef.current ? Boolean(initialDual) : false);
-				if (magKey !== initialMagRef.current) {
+				//
+				// 判断「换没换文章」必须比 path（具体期号），不能比 magKey：
+				// 同一本刊物的两期 magKey 相同，用 magKey 判断会让「换一期」也保留
+				// 对照模式，于是新一期一进来就自动翻译。
+				const sameIssue = path === initialPathRef.current;
+				setDual(sameIssue ? Boolean(initialDual) : false);
+				if (!sameIssue) {
 					const archive = readJson(CHATS_KEY, {});
 					const saved = archive[path];
 					setChat(saved && Array.isArray(saved.msgs) && saved.msgs.length ? { msgs: saved.msgs, busy: false } : null);
@@ -1698,7 +1706,9 @@ window.__ModuleLoader__.load({
 					reader: { path },
 					chat: chat && Array.isArray(chat.msgs) && chat.msgs.length ? { path, msgs: chat.msgs.map((m) => ({ role: m.role, text: m.text })) } : null,
 					chatOpen: Boolean(chatOpen),
-					dual
+					dual,
+					// 记录「对照」属于哪一期：换文章时不该继承它。
+					dualPath: path
 				};
 				writeJson(SESSION_KEY, session);
 			}, [path, chat, chatOpen, dual]);
@@ -2365,9 +2375,12 @@ window.__ModuleLoader__.load({
 			// The chat panel ALWAYS starts closed. History is one click away (topbar button);
 			// a restored session must never pop the panel open by itself.
 			const [initialChatOpen] = useState(() => false);
+			// 「对照」模式只对 session 里记录的那一期有效：
+			// 打开别的文章时不应该自动继承翻译开关。
 			const [initialDual] = useState(() => {
 				const session = readJson(SESSION_KEY, {});
-				return Boolean(session && session.dual);
+				if (!session || !session.dual) return false;
+				return Boolean(session.reader && session.dualPath === session.reader.path);
 			});
 
 			const loadShelf = useCallback(async (refresh) => {
