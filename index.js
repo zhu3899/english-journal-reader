@@ -16,6 +16,114 @@ import path from 'node:path';
 import os from 'node:os';
 import zlib from 'node:zlib';
 
+// —— LLM 调用队列 ——
+//
+// MiniMax 等服务商按 RPM（每分钟请求数）限流，免费账户常常只有 20 RPM。
+// 「对照」模式会给每个进入视口的段落各发一次请求，一屏就可能打出去
+// 5~8 个并发，瞬间撞上 429 / code 1302（Rate limit reached for requests）。
+//
+// 这里做两件事：
+//   1. 队列：所有 LLM 请求串行（并发上限 1），客户端怎么触发都不会瞬时打爆 RPM。
+//   2. 退避重试：429 是暂时性的，等配额窗口滑动一下就好，不该直接失败。
+//
+// 三个入口（翻译 / 讲解 / 问答）共用这一层。
+const LLM_MAX_CONCURRENCY = 1;
+const LLM_RETRY_ATTEMPTS = 3;
+const LLM_RETRY_DELAYS_MS = [1200, 4000, 10000];
+
+const llmQueue = [];
+let llmActive = 0;
+
+/** 是否是限流错误（429 / code 1302 / rate limit 文案）。 */
+function isRateLimitError(error) {
+	if (!error) return false;
+	if (error.code === 429 || error.status === 429) return true;
+	if (String(error.code) === '1302') return true;
+	const message = String(error.message || '').toLowerCase();
+	return message.includes('rate limit')
+		|| message.includes('1302')
+		|| message.includes('too many requests')
+		|| message.includes('请求过于频繁')
+		|| message.includes('限流');
+}
+
+/** 把任务放进队列；队列满了就按 FIFO 等前面的腾出位置。 */
+function enqueueLlm(task) {
+	return new Promise((resolve, reject) => {
+		llmQueue.push({ task, resolve, reject });
+		pumpLlmQueue();
+	});
+}
+
+function pumpLlmQueue() {
+	while (llmActive < LLM_MAX_CONCURRENCY && llmQueue.length) {
+		const entry = llmQueue.shift();
+		llmActive += 1;
+		Promise.resolve()
+			.then(entry.task)
+			.then(entry.resolve, entry.reject)
+			.finally(() => {
+				llmActive -= 1;
+				pumpLlmQueue();
+			});
+	}
+}
+
+const llmSleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+/**
+ * 排队执行一次 LLM 流式请求，遇限流自动退避重试。
+ *
+ * onChunk 收到每个文本增量；onReasoning 收到思考增量（若有）。
+ * onRetry 在每次退避前回调，客户端可以据此提示「限流，等待中」。
+ */
+async function streamLlm(llm, request_, onChunk, onReasoning, onRetry, shouldAbort) {
+	let lastError = null;
+	for (let attempt = 0; attempt <= LLM_RETRY_ATTEMPTS; attempt++) {
+		if (shouldAbort && shouldAbort()) return { text: '', aborted: true };
+		try {
+			let acc = '';
+			let finish;
+			for await (const chunk of llm.stream(request_)) {
+				if (shouldAbort && shouldAbort()) return { text: acc, aborted: true };
+				if (!chunk) continue;
+				if (chunk.type === 'text-delta' && typeof chunk.text === 'string') {
+					acc += chunk.text;
+					onChunk?.(chunk.text);
+				} else if (chunk.type === 'reasoning-delta' && typeof chunk.text === 'string') {
+					onReasoning?.(chunk.text);
+				} else if (chunk.type === 'finish') {
+					finish = chunk.reason;
+				}
+			}
+			// 上游可能把限流当成一次「正常结束」报回来（finish.kind === 'error'）。
+			if (finish && finish.kind === 'error') {
+				const failure = finish.failure || {};
+				const failureError = Object.assign(
+					new Error(failure.message || 'llm request failed'),
+					{ code: failure.code, status: failure.status }
+				);
+				if (isRateLimitError(failureError)) {
+					lastError = failureError;
+					if (attempt < LLM_RETRY_ATTEMPTS) {
+						onRetry?.(attempt + 1, LLM_RETRY_DELAYS_MS[attempt], failureError);
+						await llmSleep(LLM_RETRY_DELAYS_MS[attempt]);
+						continue;
+					}
+				}
+				return { text: acc, finish, error: failureError };
+			}
+			return { text: acc, finish };
+		} catch (error) {
+			lastError = error;
+			if (!isRateLimitError(error) || attempt >= LLM_RETRY_ATTEMPTS) throw error;
+			onRetry?.(attempt + 1, LLM_RETRY_DELAYS_MS[attempt], error);
+			await llmSleep(LLM_RETRY_DELAYS_MS[attempt]);
+		}
+	}
+	throw lastError || new Error('llm request failed');
+}
+
 // —— 数据源 ——
 // 一份刊物可以来自不同仓库：hehonghui 的合集仓库覆盖广，
 // Monkfishare 用爬虫维护、一刊一仓库，目录结构也不同（<刊>/<年>/<期号>/）。
@@ -830,8 +938,6 @@ async function handleTranslate(ctx, req, res) {
 	res.statusCode = 200;
 	res.setHeader('content-type', 'text/plain; charset=utf-8');
 	res.setHeader('cache-control', 'no-store');
-	let acc = '';
-	let finish;
 	try {
 		const request_ = {
 			provider: model.provider,
@@ -846,20 +952,21 @@ async function handleTranslate(ctx, req, res) {
 				}]
 			}]
 		};
-		for await (const chunk of llm.stream(request_)) {
-			if (aborted) break;
-			if (chunk && chunk.type === 'text-delta' && typeof chunk.text === 'string') {
-				acc += chunk.text;
-				res.write(chunk.text);
-			} else if (chunk && chunk.type === 'finish') {
-				finish = chunk.reason;
-			}
-		}
-		if (!aborted && finish && finish.kind === 'error') {
-			const note = finish.failure?.message ? `\n\n[翻译失败：${finish.failure.message}]` : '\n\n[翻译失败]';
+		// 排队执行，限流时自动退避重试。
+		const result = await enqueueLlm(() => streamLlm(
+			llm,
+			request_,
+			(text2) => { if (!aborted) res.write(text2); },
+			null,
+			(attempt, delay) => { if (!aborted) res.write(`\n[限流中，${Math.round(delay / 1000)} 秒后重试（第 ${attempt} 次）…]\n`); },
+			() => aborted
+		));
+		if (result.aborted) return;
+		if (result.error) {
+			const note = result.error.message ? `\n\n[翻译失败：${result.error.message}]` : '\n\n[翻译失败]';
 			res.write(note);
-		} else if (!aborted && acc) {
-			transCache.set(text, acc);
+		} else if (result.text) {
+			transCache.set(text, result.text);
 			if (transCache.size > 400) transCache.delete(transCache.keys().next().value);
 		}
 	} catch (error) {
@@ -1185,7 +1292,6 @@ async function handleExplain(ctx, url, res, req) {
 	res.statusCode = 200;
 	res.setHeader('content-type', 'text/plain; charset=utf-8');
 	res.setHeader('cache-control', 'no-store');
-	let finish;
 	try {
 		const request_ = {
 			provider: model.provider,
@@ -1194,13 +1300,18 @@ async function handleExplain(ctx, url, res, req) {
 			...(model.reasoningEffort ? { reasoningEffort: model.reasoningEffort } : {}),
 			messages: [{ role: 'user', content: [{ type: 'text', text: buildExplainPrompt(mode, text) }] }]
 		};
-		for await (const chunk of llm.stream(request_)) {
-			if (aborted) break;
-			if (chunk && chunk.type === 'text-delta' && typeof chunk.text === 'string') res.write(chunk.text);
-			else if (chunk && chunk.type === 'finish') finish = chunk.reason;
-		}
-		if (!aborted && finish && finish.kind === 'error') {
-			const note = finish.failure?.message ? `\n\n[AI 讲解失败：${finish.failure.message}]` : '\n\n[AI 讲解失败]';
+		// 排队执行，限流时自动退避重试。
+		const result = await enqueueLlm(() => streamLlm(
+			llm,
+			request_,
+			(text2) => { if (!aborted) res.write(text2); },
+			null,
+			(attempt, delay) => { if (!aborted) res.write(`\n[限流中，${Math.round(delay / 1000)} 秒后重试（第 ${attempt} 次）…]\n`); },
+			() => aborted
+		));
+		if (result.aborted) return;
+		if (result.error) {
+			const note = result.error.message ? `\n\n[AI 讲解失败：${result.error.message}]` : '\n\n[AI 讲解失败]';
 			res.write(note);
 		}
 	} catch (error) {
@@ -1236,7 +1347,6 @@ async function handleAsk(ctx, req, res) {
 	res.statusCode = 200;
 	res.setHeader('content-type', 'application/x-ndjson; charset=utf-8');
 	res.setHeader('cache-control', 'no-store');
-	let finish;
 	// 思考过程与正文分帧下发：thinking 模型在给出正文前会思考十几秒，
 	// 把 reasoning-delta 一并转发，客户端就能立刻显示「正在思考」而不是干等。
 	const send = (frame) => {
@@ -1262,16 +1372,19 @@ async function handleAsk(ctx, req, res) {
 			...(model.reasoningEffort ? { reasoningEffort: model.reasoningEffort } : {}),
 			messages: [{ role: 'user', content: [{ type: 'text', text: prompt }] }]
 		};
-		for await (const chunk of llm.stream(request_)) {
-			if (aborted) break;
-			if (chunk && chunk.type === 'text-delta' && typeof chunk.text === 'string') {
-				send({ type: 'text', text: chunk.text });
-			} else if (chunk && chunk.type === 'reasoning-delta' && typeof chunk.text === 'string') {
-				send({ type: 'reasoning', text: chunk.text });
-			} else if (chunk && chunk.type === 'finish') finish = chunk.reason;
-		}
-		if (!aborted && finish && finish.kind === 'error') {
-			const note = finish.failure?.message ? `\n\n[回答失败：${finish.failure.message}]` : '\n\n[回答失败]';
+		// 排队执行，限流时自动退避重试。
+		// 重试会从头再来一遍，所以重试提示单独一帧，客户端能把它和正文区分开。
+		const result = await enqueueLlm(() => streamLlm(
+			llm,
+			request_,
+			(text2) => { if (!aborted) send({ type: 'text', text: text2 }); },
+			(text2) => { if (!aborted) send({ type: 'reasoning', text: text2 }); },
+			(attempt, delay) => { if (!aborted) send({ type: 'retry', attempt, delay }); },
+			() => aborted
+		));
+		if (result.aborted) return;
+		if (result.error) {
+			const note = result.error.message ? `\n\n[回答失败：${result.error.message}]` : '\n\n[回答失败]';
 			send({ type: 'text', text: note });
 		}
 	} catch (error) {
